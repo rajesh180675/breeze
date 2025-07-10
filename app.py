@@ -140,16 +140,112 @@ def get_options_chain_data(_breeze, symbol, api_expiry_date):
 # --- DATA ANALYSIS & STYLING ---
 def process_and_analyze(raw_data, spot_price):
     df = pd.DataFrame(raw_data).apply(pd.to_numeric, errors='ignore')
-    calls_df, puts_df = df[df['right'] == 'Call'], df[df['right'] == 'Put']
-    chain = pd.merge(calls_df, puts_df, on="strike_price", suffixes=('_call', '_put'), how="outer").sort_values("strike_price").fillna(0)
-    chain = chain[['oi_call', 'oi_change_call', 'ltp_call', 'strike_price', 'ltp_put', 'oi_change_put', 'oi_put']]
-    chain.columns = ['Call OI', 'Call Chng OI', 'Call LTP', 'Strike', 'Put LTP', 'Put Chng OI', 'Put OI']
+    
+    # Debug: Print column names to understand the structure
+    st.write("DEBUG: Available columns in the data:", df.columns.tolist())
+    
+    # Separate calls and puts
+    calls_df = df[df['right'] == 'Call'].copy()
+    puts_df = df[df['right'] == 'Put'].copy()
+    
+    # Try to identify the correct column names
+    # Common variations in API responses
+    possible_columns = {
+        'strike_price': ['strike_price', 'strike', 'strike_rate'],
+        'oi': ['oi', 'open_interest', 'openinterest'],
+        'oi_change': ['oi_change', 'oi_change_per', 'change_oi', 'changeinoi'],
+        'ltp': ['ltp', 'last_traded_price', 'last_price', 'close']
+    }
+    
+    # Find actual column names
+    actual_columns = {}
+    for key, variants in possible_columns.items():
+        for variant in variants:
+            if variant in df.columns:
+                actual_columns[key] = variant
+                break
+    
+    st.write("DEBUG: Mapped columns:", actual_columns)
+    
+    # Check if we have the essential columns
+    if 'strike_price' not in actual_columns:
+        raise Exception("Could not find strike price column in the data")
+    
+    strike_col = actual_columns['strike_price']
+    oi_col = actual_columns.get('oi', 'oi')
+    oi_change_col = actual_columns.get('oi_change', 'oi_change')
+    ltp_col = actual_columns.get('ltp', 'ltp')
+    
+    # Merge calls and puts
+    chain = pd.merge(calls_df, puts_df, on=strike_col, suffixes=('_call', '_put'), how="outer")
+    chain = chain.sort_values(strike_col).fillna(0)
+    
+    # Build the final columns dynamically
+    final_columns = []
+    final_column_names = []
+    
+    # Call OI
+    call_oi_col = f"{oi_col}_call"
+    if call_oi_col in chain.columns:
+        final_columns.append(call_oi_col)
+        final_column_names.append('Call OI')
+    
+    # Call OI Change
+    call_oi_change_col = f"{oi_change_col}_call"
+    if call_oi_change_col in chain.columns:
+        final_columns.append(call_oi_change_col)
+        final_column_names.append('Call Chng OI')
+    
+    # Call LTP
+    call_ltp_col = f"{ltp_col}_call"
+    if call_ltp_col in chain.columns:
+        final_columns.append(call_ltp_col)
+        final_column_names.append('Call LTP')
+    
+    # Strike Price
+    final_columns.append(strike_col)
+    final_column_names.append('Strike')
+    
+    # Put LTP
+    put_ltp_col = f"{ltp_col}_put"
+    if put_ltp_col in chain.columns:
+        final_columns.append(put_ltp_col)
+        final_column_names.append('Put LTP')
+    
+    # Put OI Change
+    put_oi_change_col = f"{oi_change_col}_put"
+    if put_oi_change_col in chain.columns:
+        final_columns.append(put_oi_change_col)
+        final_column_names.append('Put Chng OI')
+    
+    # Put OI
+    put_oi_col = f"{oi_col}_put"
+    if put_oi_col in chain.columns:
+        final_columns.append(put_oi_col)
+        final_column_names.append('Put OI')
+    
+    # Select only available columns
+    chain = chain[final_columns]
+    chain.columns = final_column_names
+    
+    # Calculate analytics
     atm_strike = min(chain['Strike'], key=lambda x: abs(x - spot_price))
-    total_call_oi, total_put_oi = chain['Call OI'].sum(), chain['Put OI'].sum()
-    pcr_oi = round(total_put_oi / total_call_oi if total_call_oi > 0 else 0, 2)
-    max_call_oi_strike = chain.loc[chain['Call OI'].idxmax()]['Strike'] if not chain['Call OI'].empty else 0
-    max_put_oi_strike = chain.loc[chain['Put OI'].idxmax()]['Strike'] if not chain['Put OI'].empty else 0
-    return chain, {'pcr_oi': pcr_oi, 'max_call_oi_strike': max_call_oi_strike, 'max_put_oi_strike': max_put_oi_strike, 'atm_strike': atm_strike}
+    
+    # Calculate PCR (Put-Call Ratio) with safety checks
+    call_oi_sum = chain['Call OI'].sum() if 'Call OI' in chain.columns else 0
+    put_oi_sum = chain['Put OI'].sum() if 'Put OI' in chain.columns else 0
+    pcr_oi = round(put_oi_sum / call_oi_sum if call_oi_sum > 0 else 0, 2)
+    
+    # Find max OI strikes with safety checks
+    max_call_oi_strike = chain.loc[chain['Call OI'].idxmax()]['Strike'] if 'Call OI' in chain.columns and not chain['Call OI'].empty else 0
+    max_put_oi_strike = chain.loc[chain['Put OI'].idxmax()]['Strike'] if 'Put OI' in chain.columns and not chain['Put OI'].empty else 0
+    
+    return chain, {
+        'pcr_oi': pcr_oi, 
+        'max_call_oi_strike': max_call_oi_strike, 
+        'max_put_oi_strike': max_put_oi_strike, 
+        'atm_strike': atm_strike
+    }
 
 def style_dataframe(df, atm_strike, spot_price):
     def style_row(row):
