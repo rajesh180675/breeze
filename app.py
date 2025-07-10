@@ -38,14 +38,14 @@ def initialize_breeze(api_key, api_secret, session_token):
         st.error(f"Connection Failed: {e}")
         return None
 
-# --- DATA FETCHING & PROCESSING (ROBUST VERSION) ---
+# --- DATA FETCHING & PROCESSING (BULLETPROOF VERSION) ---
 
+# Renaming the function to force a new cache entry and adding a robust internal check.
 @st.cache_data(ttl=3600, show_spinner="Fetching available expiry dates...")
-def get_expiry_map(_breeze, symbol):
+def prepare_expiry_data(_breeze, symbol):
     """
     Fetches expiry dates and returns a ready-to-use map.
-    This is the ROBUST FIX: All date parsing is encapsulated here.
-    The main script will never parse dates, preventing the error.
+    This function is designed to be self-healing against cache corruption.
     """
     try:
         spot_data = _breeze.get_quotes(stock_code=symbol, exchange_code="NSE", product_type="cash")
@@ -65,11 +65,18 @@ def get_expiry_map(_breeze, symbol):
         
         raw_dates = sorted(list(set(item['expiry_date'] for item in data['Success'])))
         
-        # Create the display-to-api map directly inside the cached function
-        expiry_map = {
-            datetime.strptime(d, "%Y-%m-%dT%H:%M:%S.%fZ").strftime("%d-%b-%Y"): d
-            for d in raw_dates
-        }
+        expiry_map = {}
+        for d in raw_dates:
+            # BULLETPROOF CHECK: Only attempt to parse if it looks like an API date.
+            if isinstance(d, str) and 'T' in d:
+                try:
+                    display_date = datetime.strptime(d, "%Y-%m-%dT%H:%M:%S.%fZ").strftime("%d-%b-%Y")
+                    expiry_map[display_date] = d # Store original raw date as value
+                except ValueError:
+                    # If parsing fails for any reason, skip this date to avoid crashing.
+                    st.warning(f"Skipping malformed date from API: {d}")
+                    continue
+        
         return expiry_map
     except Exception as e:
         st.error(f"Could not fetch expiry dates: {e}")
@@ -96,7 +103,7 @@ def get_options_chain_data(_breeze, symbol, api_expiry_date):
         st.error(f"Failed to fetch options chain: {e}")
         return None, None
 
-# --- DATA ANALYSIS & STYLING (No changes needed here) ---
+# --- DATA ANALYSIS & STYLING (No changes needed) ---
 def process_and_analyze(raw_data, spot_price):
     df = pd.DataFrame(raw_data).apply(pd.to_numeric, errors='ignore')
     calls_df, puts_df = df[df['right'] == 'Call'], df[df['right'] == 'Put']
@@ -141,11 +148,10 @@ if session_token:
     breeze = initialize_breeze(api_key, api_secret, session_token)
     
     if breeze:
-        # 1. Get the pre-processed map directly from the cached function.
-        expiry_map = get_expiry_map(breeze, symbol)
+        # Call the newly named, robust function
+        expiry_map = prepare_expiry_data(breeze, symbol)
         
         if expiry_map:
-            # 2. The main script now deals with simple lists and lookups. No parsing!
             display_dates = list(expiry_map.keys())
 
             with st.form("options_form"):
@@ -153,9 +159,7 @@ if session_token:
                 load_button = st.form_submit_button("🚀 Load Options Chain")
 
             if load_button:
-                # 3. Look up the raw API date from the map.
                 selected_api_date = expiry_map[selected_display_date]
-                
                 raw_data, spot_price = get_options_chain_data(breeze, symbol, selected_api_date)
                 
                 if raw_data and spot_price:
