@@ -2,3 +2,6 @@ streamlit
 pandas
 breeze-connect
 python-dotenv
+numpy
+plotly
+streamlit-autorefresh
