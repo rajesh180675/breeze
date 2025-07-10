@@ -4,9 +4,9 @@ from breeze_connect import BreezeConnect
 import os
 from dotenv import load_dotenv
 from datetime import datetime
-import numpy as np # For Max Pain calculation
-import plotly.graph_objects as go # For OI Chart
-from streamlit_autorefresh import st_autorefresh # For auto-refresh
+import numpy as np
+import plotly.graph_objects as go
+from streamlit_autorefresh import st_autorefresh
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(
@@ -137,9 +137,28 @@ def create_oi_chart(chain_df, atm_strike):
     fig.update_layout(title_text='Open Interest Distribution by Strike', xaxis_title='Strike Price', yaxis_title='Open Interest', barmode='group', height=400, legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
     return fig
 
+def style_dataframe(df, atm_strike, spot_price):
+    def style_row(row):
+        styles = [''] * len(row)
+        if row.Strike < spot_price: styles[0:3] = ['background-color: #e8f5e9'] * 3
+        if row.Strike > spot_price: styles[4:7] = ['background-color: #ffebee'] * 3
+        if row.Strike == atm_strike: styles = ['background-color: #ffffc0'] * len(row)
+        return styles
+    return df.style.apply(style_row, axis=1).format({
+        'Call OI': '{:,.0f}', 'Call Chng OI': '{:,.0f}', 'Call LTP': '{:,.2f}',
+        'Strike': '{:,.0f}',
+        'Put LTP': '{:,.2f}', 'Put Chng OI': '{:,.0f}', 'Put OI': '{:,.0f}'
+    })
+
 # --- MAIN APPLICATION UI ---
 st.title("📈 Nifty Options Chain Analyzer")
 st.markdown("A comprehensive tool for analyzing options data, powered by the ICICI Breeze API.")
+
+# CORRECTED CODE: Load credentials at the start of the main script flow
+api_key, api_secret = load_credentials()
+if not api_key or not api_secret:
+    st.error("API_KEY or API_SECRET is not configured. Please set them in your Streamlit secrets or .env file.")
+    st.stop()
 
 # Sidebar for controls
 with st.sidebar:
@@ -159,6 +178,8 @@ if session_token:
         if expiry_map:
             display_dates = list(expiry_map.keys())
             selected_display_date = st.selectbox("Select Expiry Date", display_dates)
+            
+            # Use a session state to persist the button click across reruns from auto-refresh
             if st.button("🚀 Load Options Chain"):
                 st.session_state.run_load = True
 
@@ -167,43 +188,36 @@ if session_token:
                 raw_data, spot_price = get_options_chain_data(breeze, symbol, selected_api_date)
                 
                 if raw_data and spot_price:
-                    # 1. Process the full chain first
                     full_chain_df = process_and_analyze(raw_data, spot_price)
-                    
-                    # 2. Calculate analytics on the full chain
-                    additional_metrics = calculate_additional_metrics(full_chain_df)
-                    atm_strike = min(full_chain_df['Strike'], key=lambda x: abs(x - spot_price))
-                    
-                    # 3. Filter the chain for display based on user input
-                    lower_bound = spot_price * (1 - strike_range_pct / 100)
-                    upper_bound = spot_price * (1 + strike_range_pct / 100)
-                    display_chain_df = full_chain_df[(full_chain_df['Strike'] >= lower_bound) & (full_chain_df['Strike'] <= upper_bound)]
+                    if not full_chain_df.empty:
+                        additional_metrics = calculate_additional_metrics(full_chain_df)
+                        atm_strike = min(full_chain_df['Strike'], key=lambda x: abs(x - spot_price))
+                        
+                        lower_bound = spot_price * (1 - strike_range_pct / 100)
+                        upper_bound = spot_price * (1 + strike_range_pct / 100)
+                        display_chain_df = full_chain_df[(full_chain_df['Strike'] >= lower_bound) & (full_chain_df['Strike'] <= upper_bound)]
 
-                    # 4. Calculate display-specific analytics (like PCR on the visible range)
-                    total_call_oi = display_chain_df['Call OI'].sum()
-                    total_put_oi = display_chain_df['Put OI'].sum()
-                    pcr_oi = round(total_put_oi / total_call_oi if total_call_oi > 0 else 0, 2)
-                    max_call_oi_strike = display_chain_df.loc[display_chain_df['Call OI'].idxmax()]['Strike'] if not display_chain_df['Call OI'].empty else 0
-                    max_put_oi_strike = display_chain_df.loc[display_chain_df['Put OI'].idxmax()]['Strike'] if not display_chain_df['Put OI'].empty else 0
+                        total_call_oi = display_chain_df['Call OI'].sum()
+                        total_put_oi = display_chain_df['Put OI'].sum()
+                        pcr_oi = round(total_put_oi / total_call_oi if total_call_oi > 0 else 0, 2)
+                        max_call_oi_strike = display_chain_df.loc[display_chain_df['Call OI'].idxmax()]['Strike'] if not display_chain_df['Call OI'].empty else 0
+                        max_put_oi_strike = display_chain_df.loc[display_chain_df['Put OI'].idxmax()]['Strike'] if not display_chain_df['Put OI'].empty else 0
 
-                    st.header(f"{symbol} at {spot_price:,.2f}")
-                    st.caption(f"Data for expiry: {selected_display_date} | Last updated: {datetime.now().strftime('%I:%M:%S %p')}")
-                    
-                    # Display metrics
-                    col1, col2, col3, col4 = st.columns(4)
-                    col1.metric("PCR (Visible Range)", f"{pcr_oi:.2f}")
-                    col2.metric("Max Pain (Full Chain)", f"{additional_metrics['max_pain']:,.0f}")
-                    col3.metric("Max Call OI Strike", f"{max_call_oi_strike:,.0f}")
-                    col4.metric("Max Put OI Strike", f"{max_put_oi_strike:,.0f}")
+                        st.header(f"{symbol} at {spot_price:,.2f}")
+                        st.caption(f"Data for expiry: {selected_display_date} | Last updated: {datetime.now().strftime('%I:%M:%S %p')}")
+                        
+                        col1, col2, col3, col4 = st.columns(4)
+                        col1.metric("PCR (Visible Range)", f"{pcr_oi:.2f}")
+                        col2.metric("Max Pain (Full Chain)", f"{additional_metrics['max_pain']:,.0f}")
+                        col3.metric("Max Call OI Strike", f"{max_call_oi_strike:,.0f}")
+                        col4.metric("Max Put OI Strike", f"{max_put_oi_strike:,.0f}")
 
-                    # Display the styled dataframe
-                    st.dataframe(style_dataframe(display_chain_df, atm_strike, spot_price), use_container_width=True)
+                        st.dataframe(style_dataframe(display_chain_df, atm_strike, spot_price), use_container_width=True)
 
-                    # Export and Visualization Features
-                    csv = display_chain_df.to_csv(index=False).encode('utf-8')
-                    st.download_button(label="Download Displayed Data as CSV", data=csv, file_name=f"{symbol}_{selected_display_date}_options.csv", mime="text/csv")
-                    
-                    with st.expander("📊 Show Open Interest Chart", expanded=True):
-                        st.plotly_chart(create_oi_chart(display_chain_df, atm_strike), use_container_width=True)
+                        csv = display_chain_df.to_csv(index=False).encode('utf-8')
+                        st.download_button(label="Download Displayed Data as CSV", data=csv, file_name=f"{symbol}_{selected_display_date}_options.csv", mime="text/csv")
+                        
+                        with st.expander("📊 Show Open Interest Chart", expanded=True):
+                            st.plotly_chart(create_oi_chart(display_chain_df, atm_strike), use_container_width=True)
 else:
     st.info("👋 Please enter your daily session token in the sidebar to begin.")
