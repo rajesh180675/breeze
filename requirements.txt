@@ -6,3 +6,4 @@ numpy
 plotly
 streamlit-autorefresh
 scipy
+matplotlib
