@@ -340,7 +340,7 @@ def process_and_analyze(raw_data: List[Dict], spot_price: float, expiry_date: st
         call_ivs = chain['Call IV'].values / 100
         put_ivs = chain['Put IV'].values / 100
         
-                call_greeks = calculate_greeks_vectorized(call_ivs, 'Call', spot_price, strikes, t)
+        call_greeks = calculate_greeks_vectorized(call_ivs, 'Call', spot_price, strikes, t)
         put_greeks = calculate_greeks_vectorized(put_ivs, 'Put', spot_price, strikes, t)
         
         # Add Greeks to chain
