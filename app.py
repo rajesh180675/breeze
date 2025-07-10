@@ -41,16 +41,29 @@ def initialize_breeze(api_key, api_secret, session_token):
 # --- DATA FETCHING FUNCTIONS & CACHING ---
 @st.cache_data(ttl=3600, show_spinner="Fetching available expiry dates...")
 def get_expiry_dates(_breeze, symbol):
-    """Fetches and caches all available expiry dates for 1 hour."""
+    """
+    Fetches and caches all available expiry dates for 1 hour.
+    WORKAROUND: Provides a nearby strike price to satisfy API requirements.
+    """
     try:
-        # <<< FIX: Provide 'right' to satisfy API requirements.
+        # 1. Get current spot price to find a valid nearby strike
+        spot_data = _breeze.get_quotes(stock_code=symbol, exchange_code="NSE", product_type="cash")
+        if not spot_data.get('Success'):
+            raise Exception(f"Could not get spot price for expiry lookup: {spot_data.get('Error')}")
+        spot_price = float(spot_data['Success'][0]['ltp'])
+        
+        # 2. Calculate a valid strike price step (50 for Nifty/Finnifty, 100 for Banknifty)
+        step = 100 if symbol == "BANKNIFTY" else 50
+        nearby_strike = round(spot_price / step) * step
+
+        # 3. Call API with the nearby_strike to get all expiries for that strike
         data = _breeze.get_option_chain_quotes(
             stock_code=symbol,
             exchange_code="NFO",
             product_type="options",
             right="Call",
-            expiry_date=None,
-            strike_price=None
+            expiry_date=None, # Leave expiry blank
+            strike_price=nearby_strike # Provide a valid strike price
         )
         if not data.get('Success'):
             raise Exception(f"API Error: {data.get('Error', 'Unknown error')}")
@@ -102,8 +115,8 @@ def process_and_analyze(raw_data, spot_price):
     total_call_oi = chain['Call OI'].sum()
     total_put_oi = chain['Put OI'].sum()
     pcr_oi = round(total_put_oi / total_call_oi if total_call_oi > 0 else 0, 2)
-    max_call_oi_strike = chain.loc[chain['Call OI'].idxmax()]['Strike']
-    max_put_oi_strike = chain.loc[chain['Put OI'].idxmax()]['Strike']
+    max_call_oi_strike = chain.loc[chain['Call OI'].idxmax()]['Strike'] if not chain['Call OI'].empty else 0
+    max_put_oi_strike = chain.loc[chain['Put OI'].idxmax()]['Strike'] if not chain['Put OI'].empty else 0
 
     analytics = {
         'pcr_oi': pcr_oi, 'max_call_oi_strike': max_call_oi_strike,
@@ -116,15 +129,15 @@ def style_dataframe(df, atm_strike, spot_price):
     """Applies conditional formatting to the DataFrame."""
     def style_row(row):
         styles = [''] * len(row)
-        # Highlight ATM strike
-        if row.Strike == atm_strike:
-            styles = ['background-color: #ffffbe'] * len(row)
         # Highlight ITM Calls
         if row.Strike < spot_price:
-            styles[0:3] = ['background-color: #e0f2f1'] * 3 # Light teal for Call OI, Chng OI, LTP
+            styles[0:3] = ['background-color: #e8f5e9'] * 3 # Light green for Calls
         # Highlight ITM Puts
         if row.Strike > spot_price:
-            styles[4:7] = ['background-color: #e0f2f1'] * 3 # Light teal for Put LTP, Chng OI, OI
+            styles[4:7] = ['background-color: #ffebee'] * 3 # Light red for Puts
+        # Highlight ATM strike (overwrites other styles)
+        if row.Strike == atm_strike:
+            styles = ['background-color: #ffffc0'] * len(row) # Light yellow for ATM
         return styles
 
     return df.style.apply(style_row, axis=1).format({
@@ -151,16 +164,13 @@ with st.sidebar:
     symbol = st.selectbox("Select Symbol", ["NIFTY", "BANKNIFTY", "FINNIFTY"])
 
 # --- Main App Logic ---
-# Only proceed if the session token is entered.
 if session_token:
     breeze = initialize_breeze(api_key, api_secret, session_token)
     
-    # If connection is successful, show the rest of the controls.
     if breeze:
         expiry_dates = get_expiry_dates(breeze, symbol)
         
         if expiry_dates:
-            # Create a form for the final action to prevent re-running on every widget change
             with st.form("options_form"):
                 selected_expiry = st.selectbox("Select Expiry Date", expiry_dates)
                 load_button = st.form_submit_button("🚀 Load Options Chain")
@@ -180,7 +190,6 @@ if session_token:
                     col3.metric("Max Put OI Strike", f"{analytics['max_put_oi_strike']:,.0f}")
                     col4.metric("ATM Strike", f"{analytics['atm_strike']:,.0f}")
                     
-                    # Also passed spot_price to correctly style ITM/OTM
                     st.dataframe(style_dataframe(chain_df, analytics['atm_strike'], spot_price), use_container_width=True)
 else:
-    st.info("Please enter your daily session token in the sidebar to begin.")
+    st.info("👋 Please enter your daily session token in the sidebar to begin.")
