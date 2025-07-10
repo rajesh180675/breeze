@@ -978,7 +978,7 @@ def main():
                             with col3:
                                 st.metric("Put/Call Volume Ratio", f"{vol_ratio:.2f}")
                     
-                     with tab5:
+                    with tab5:
                         if show_greeks and 'call_delta' in full_chain_df.columns:
                             # Greeks visualization options
                             greek_col1, greek_col2 = st.columns(2)
