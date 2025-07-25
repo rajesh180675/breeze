@@ -15,11 +15,13 @@ import json
 import logging
 from io import BytesIO
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional, Any, Deque
+from typing import Dict, List, Tuple, Optional, Any, Deque, Callable
 from collections import deque
 import threading
 from queue import Queue
 import warnings
+import websocket
+import asyncio
 warnings.filterwarnings('ignore')
 
 # --- CONFIGURATION ---
@@ -89,7 +91,7 @@ logger = logging.getLogger(__name__)
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(
-    page_title="Pro Options Analyzer - Real-Time", 
+    page_title="Pro Options Analyzer - WebSocket Real-Time", 
     page_icon="🚀", 
     layout="wide",
     initial_sidebar_state="expanded"
@@ -98,6 +100,10 @@ st.set_page_config(
 # --- CUSTOM EXCEPTIONS ---
 class BreezeAPIError(Exception):
     """Custom exception for Breeze API errors"""
+    pass
+
+class WebSocketError(Exception):
+    """Custom exception for WebSocket errors"""
     pass
 
 # --- OI FLOW ANALYSIS DATA STRUCTURES ---
@@ -126,20 +132,19 @@ class RealTimeAlert:
     severity: str
     data: Dict[str, Any]
 
-# --- REAL-TIME DATA STREAMER ---
-class RealTimeDataStreamer:
-    """Real-time data streaming for options analysis"""
+# --- WEBSOCKET DATA STREAMER ---
+class WebSocketDataStreamer:
+    """WebSocket-based real-time data streaming for options analysis"""
     
-    def __init__(self, breeze_connection, symbol: str, expiry_date: str):
+    def __init__(self, breeze_connection: BreezeConnect, symbol: str, expiry_date: str):
         self.breeze = breeze_connection
         self.symbol = symbol
         self.expiry_date = expiry_date
         self.is_streaming = False
-        self.streaming_thread = None
+        self.ws_connected = False
         
         # Data storage
-        self.data_queue = Queue(maxsize=100)
-        self.last_data = None
+        self.last_data = {}
         self.tick_count = 0
         
         # Real-time buffers
@@ -148,373 +153,536 @@ class RealTimeDataStreamer:
         self.alerts_buffer: Deque[RealTimeAlert] = deque(maxlen=config.REALTIME_ALERT_BUFFER_SIZE)
         
         # Thresholds
-        self.oi_change_threshold = 1000  # Minimum OI change to trigger alert
-        self.price_change_threshold = 0.05  # 5% price change threshold
-        self.rapid_change_window = 30  # 30 seconds for rapid change detection
+        self.oi_change_threshold = 1000
+        self.price_change_threshold = 0.05
+        self.rapid_change_window = 30
         
-    def start_streaming(self):
-        """Start real-time data streaming"""
-        try:
-            if not self.is_streaming:
-                self.is_streaming = True
-                self.streaming_thread = threading.Thread(target=self._stream_data, daemon=True)
-                self.streaming_thread.start()
-                logger.info(f"Real-time streaming started for {self.symbol}")
-                return True
-            return False
-        except Exception as e:
-            logger.error(f"Failed to start streaming: {e}")
-            self.is_streaming = False
-            return False
-    
-    def stop_streaming(self):
-        """Stop real-time data streaming"""
-        try:
-            if self.is_streaming:
-                self.is_streaming = False
-                if self.streaming_thread:
-                    self.streaming_thread.join(timeout=5)
-                logger.info(f"Real-time streaming stopped for {self.symbol}")
-                return True
-            return False
-        except Exception as e:
-            logger.error(f"Failed to stop streaming: {e}")
-            return False
-    
-    def _stream_data(self):
-        """Main streaming loop"""
-        consecutive_errors = 0
-        max_consecutive_errors = 5
+        # WebSocket callbacks
+        self.on_ticks = self._on_ticks_update
         
-        while self.is_streaming:
-            try:
-                # Fetch current snapshot
-                current_data = self._fetch_current_snapshot()
-                
-                if current_data:
-                    # Reset error counter on successful fetch
-                    consecutive_errors = 0
-                    
-                    # Detect changes if we have previous data
-                    if self.last_data:
-                        changes = self._detect_changes(current_data)
-                        if changes:
-                            # Add timestamp and tick number
-                            changes['timestamp'] = datetime.now()
-                            changes['tick_number'] = self.tick_count
-                            
-                            # Store in queue for UI processing
-                            if not self.data_queue.full():
-                                self.data_queue.put(changes)
-                            
-                            # Update buffers and generate alerts
-                            self._update_buffers(changes)
-                            self._generate_real_time_alerts(changes)
-                            
-                            self.tick_count += 1
-                    
-                    # Update last data
-                    self.last_data = current_data
-                else:
-                    consecutive_errors += 1
-                    logger.warning(f"Failed to fetch data, consecutive errors: {consecutive_errors}")
-                
-                # Break if too many consecutive errors
-                if consecutive_errors >= max_consecutive_errors:
-                    logger.error(f"Too many consecutive errors ({consecutive_errors}), stopping stream")
-                    self.is_streaming = False
-                    break
-                
-                # Sleep between fetches
-                time.sleep(config.REALTIME_FETCH_INTERVAL)
-                
-            except Exception as e:
-                consecutive_errors += 1
-                logger.error(f"Streaming error: {e}")
-                if consecutive_errors >= max_consecutive_errors:
-                    self.is_streaming = False
-                    break
-                time.sleep(5)  # Wait longer on error
+        # Strike list to monitor
+        self.monitored_strikes = []
+        self._initialize_strikes()
+        
+        # Thread safety
+        self.data_lock = threading.Lock()
     
-    def _fetch_current_snapshot(self) -> Optional[Dict]:
-        """Fetch current options data snapshot"""
+    def _initialize_strikes(self):
+        """Initialize the list of strikes to monitor"""
         try:
-            # Fetch call options
-            call_data = self.breeze.get_option_chain_quotes(
-                stock_code=self.symbol,
-                exchange_code="NFO",
-                product_type="options",
-                right="Call",
-                expiry_date=self.expiry_date
-            )
-            
-            # Fetch put options
-            put_data = self.breeze.get_option_chain_quotes(
-                stock_code=self.symbol,
-                exchange_code="NFO",
-                product_type="options",
-                right="Put",
-                expiry_date=self.expiry_date
-            )
-            
-            # Fetch spot price
+            # Get current spot price
             spot_data = self.breeze.get_quotes(
                 stock_code=self.symbol,
                 exchange_code="NSE",
                 product_type="cash"
             )
-            
-            # Check if all requests succeeded
-            if (call_data.get('Success') and put_data.get('Success') and 
-                spot_data.get('Success')):
+            if spot_data.get('Success'):
+                spot_price = float(spot_data['Success'][0]['ltp'])
                 
-                return {
-                    'calls': call_data['Success'],
-                    'puts': put_data['Success'],
-                    'spot': float(spot_data['Success'][0]['ltp']),
-                    'timestamp': datetime.now()
-                }
+                # Calculate strike range (e.g., +/- 5% from spot)
+                strike_step = config.get_strike_step(self.symbol)
+                lower_bound = int((spot_price * 0.95) / strike_step) * strike_step
+                upper_bound = int((spot_price * 1.05) / strike_step) * strike_step
+                
+                # Generate strike list
+                self.monitored_strikes = list(range(lower_bound, upper_bound + strike_step, strike_step))
+                logger.info(f"Monitoring {len(self.monitored_strikes)} strikes from {lower_bound} to {upper_bound}")
+        except Exception as e:
+            logger.error(f"Error initializing strikes: {e}")
+            self.monitored_strikes = []
+    
+    def start_streaming(self) -> bool:
+        """Start WebSocket streaming"""
+        try:
+            if not self.is_streaming:
+                # Connect to WebSocket
+                self.breeze.ws_connect()
+                self.ws_connected = True
+                
+                # Set up callbacks
+                self.breeze.on_ticks = self.on_ticks
+                
+                # Subscribe to feeds
+                self._subscribe_to_feeds()
+                
+                self.is_streaming = True
+                logger.info(f"WebSocket streaming started for {self.symbol}")
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Failed to start WebSocket streaming: {e}")
+            self.is_streaming = False
+            self.ws_connected = False
+            raise WebSocketError(f"Failed to start streaming: {e}")
+    
+    def stop_streaming(self) -> bool:
+        """Stop WebSocket streaming"""
+        try:
+            if self.is_streaming:
+                # Unsubscribe from feeds
+                self._unsubscribe_from_feeds()
+                
+                # Disconnect WebSocket
+                if self.ws_connected:
+                    self.breeze.ws_disconnect()
+                    self.ws_connected = False
+                
+                self.is_streaming = False
+                logger.info(f"WebSocket streaming stopped for {self.symbol}")
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Failed to stop WebSocket streaming: {e}")
+            return False
+    
+    def _subscribe_to_feeds(self):
+        """Subscribe to relevant option feeds"""
+        try:
+            # Subscribe to spot price
+            self.breeze.subscribe_feeds(
+                stock_code=self.symbol,
+                exchange_code="NSE",
+                product_type="cash",
+                get_exchange_quotes=True,
+                get_market_depth=False
+            )
+            
+            # Subscribe to option chains for monitored strikes
+            for strike in self.monitored_strikes:
+                # Subscribe to calls
+                self.breeze.subscribe_feeds(
+                    stock_code=self.symbol,
+                    exchange_code="NFO",
+                    product_type="options",
+                    expiry_date=self.expiry_date,
+                    strike_price=str(strike),
+                    right="Call",
+                    get_exchange_quotes=True,
+                    get_market_depth=False
+                )
+                
+                # Subscribe to puts
+                self.breeze.subscribe_feeds(
+                    stock_code=self.symbol,
+                    exchange_code="NFO",
+                    product_type="options",
+                    expiry_date=self.expiry_date,
+                    strike_price=str(strike),
+                    right="Put",
+                    get_exchange_quotes=True,
+                    get_market_depth=False
+                )
+            
+            logger.info(f"Subscribed to {len(self.monitored_strikes) * 2 + 1} feeds")
             
         except Exception as e:
-            logger.error(f"Error fetching snapshot: {e}")
-        
-        return None
+            logger.error(f"Error subscribing to feeds: {e}")
+            raise WebSocketError(f"Failed to subscribe to feeds: {e}")
     
-    def _detect_changes(self, current_data: Dict) -> Optional[Dict]:
-        """Detect changes from previous snapshot"""
+    def _unsubscribe_from_feeds(self):
+        """Unsubscribe from all feeds"""
         try:
-            if not self.last_data:
-                return None
+            # Unsubscribe from spot
+            self.breeze.unsubscribe_feeds(
+                stock_code=self.symbol,
+                exchange_code="NSE",
+                product_type="cash"
+            )
             
-            changes = {
-                'oi_changes': [],
-                'price_changes': [],
-                'volume_changes': [],
-                'spot_change': current_data['spot'] - self.last_data['spot'],
-                'spot_change_pct': ((current_data['spot'] - self.last_data['spot']) / self.last_data['spot']) * 100
+            # Unsubscribe from options
+            for strike in self.monitored_strikes:
+                self.breeze.unsubscribe_feeds(
+                    stock_code=self.symbol,
+                    exchange_code="NFO",
+                    product_type="options",
+                    expiry_date=self.expiry_date,
+                    strike_price=str(strike),
+                    right="Call"
+                )
+                
+                self.breeze.unsubscribe_feeds(
+                    stock_code=self.symbol,
+                    exchange_code="NFO",
+                    product_type="options",
+                    expiry_date=self.expiry_date,
+                    strike_price=str(strike),
+                    right="Put"
+                )
+                
+        except Exception as e:
+            logger.error(f"Error unsubscribing from feeds: {e}")
+    
+    def _on_ticks_update(self, ticks):
+        """Handle incoming tick data"""
+        try:
+            with self.data_lock:
+                self.tick_count += 1
+                
+                for tick in ticks:
+                    # Parse tick data
+                    symbol = tick.get('stock_code', '')
+                    product = tick.get('product_type', '')
+                    
+                    if symbol != self.symbol:
+                        continue
+                    
+                    # Update data based on product type
+                    if product == 'cash':
+                        self._update_spot_data(tick)
+                    elif product == 'options':
+                        self._update_option_data(tick)
+                
+                # Check for significant changes
+                self._detect_and_alert_changes()
+            
+        except Exception as e:
+            logger.error(f"Error processing tick data: {e}")
+    
+    def _update_spot_data(self, tick):
+        """Update spot price data"""
+        try:
+            current_spot = float(tick.get('ltp', 0))
+            
+            if 'spot' in self.last_data:
+                prev_spot = self.last_data['spot']
+                change = current_spot - prev_spot
+                change_pct = (change / prev_spot) * 100 if prev_spot > 0 else 0
+                
+                # Store spot change
+                self.last_data['spot_change'] = change
+                self.last_data['spot_change_pct'] = change_pct
+            
+            self.last_data['spot'] = current_spot
+            self.last_data['spot_timestamp'] = datetime.now()
+            
+        except Exception as e:
+            logger.error(f"Error updating spot data: {e}")
+    
+    def _update_option_data(self, tick):
+        """Update option data and detect changes"""
+        try:
+            strike = float(tick.get('strike_price', 0))
+            right = tick.get('right', '')
+            ltp = float(tick.get('ltp', 0))
+            oi = int(tick.get('open_interest', 0))
+            volume = int(tick.get('volume', 0))
+            bid = float(tick.get('best_bid_price', 0))
+            ask = float(tick.get('best_ask_price', 0))
+            
+            # Create unique key
+            key = f"{strike}_{right}"
+            
+            # Check for OI changes
+            if key in self.last_data:
+                prev_data = self.last_data[key]
+                
+                # OI change detection
+                oi_change = oi - prev_data.get('oi', 0)
+                if abs(oi_change) > 0:
+                    self.oi_changes_buffer.append({
+                        'timestamp': datetime.now(),
+                        'strike': strike,
+                        'type': right.upper(),
+                        'oi_change': oi_change,
+                        'current_oi': oi,
+                        'prev_oi': prev_data.get('oi', 0),
+                        'ltp': ltp,
+                        'volume': volume,
+                        'bid_ask_spread': ask - bid if ask > 0 and bid > 0 else 0
+                    })
+                    
+                    # Generate alert for large OI changes
+                    if abs(oi_change) >= self.oi_change_threshold:
+                        self._generate_oi_alert(strike, right, oi_change, oi)
+                
+                # Price change detection
+                prev_ltp = prev_data.get('ltp', 0)
+                if prev_ltp > 0:
+                    price_change = ltp - prev_ltp
+                    price_change_pct = (price_change / prev_ltp) * 100
+                    
+                    if abs(price_change_pct) > self.price_change_threshold * 100:
+                        self.price_changes_buffer.append({
+                            'timestamp': datetime.now(),
+                            'strike': strike,
+                            'type': right.upper(),
+                            'price_change': price_change,
+                            'price_change_pct': price_change_pct,
+                            'current_ltp': ltp,
+                            'prev_ltp': prev_ltp
+                        })
+                        
+                        # Generate price alert
+                        if abs(price_change_pct) >= 10:
+                            self._generate_price_alert(strike, right, price_change_pct)
+            
+            # Update last data
+            self.last_data[key] = {
+                'oi': oi,
+                'ltp': ltp,
+                'volume': volume,
+                'bid': bid,
+                'ask': ask,
+                'timestamp': datetime.now()
             }
             
-            # Process calls
-            for current_call in current_data['calls']:
-                prev_call = self._find_previous_option(self.last_data['calls'], current_call['strike_price'])
+        except Exception as e:
+            logger.error(f"Error updating option data: {e}")
+    
+    def _generate_oi_alert(self, strike: float, option_type: str, oi_change: int, current_oi: int):
+        """Generate alert for significant OI change"""
+        severity = 'HIGH' if abs(oi_change) >= 2000 else 'MEDIUM'
+        
+        alert = RealTimeAlert(
+            timestamp=datetime.now(),
+            alert_type='LARGE_OI_CHANGE',
+            strike=strike,
+            option_type=option_type.upper(),
+            message=f"Large {option_type.upper()} OI change: {oi_change:+,} at strike {strike} (Total: {current_oi:,})",
+            severity=severity,
+            data={'oi_change': oi_change, 'current_oi': current_oi}
+        )
+        self.alerts_buffer.append(alert)
+    
+    def _generate_price_alert(self, strike: float, option_type: str, price_change_pct: float):
+        """Generate alert for significant price movement"""
+        severity = 'HIGH' if abs(price_change_pct) >= 20 else 'MEDIUM'
+        
+        alert = RealTimeAlert(
+            timestamp=datetime.now(),
+            alert_type='UNUSUAL_PRICE_MOVE',
+            strike=strike,
+            option_type=option_type.upper(),
+            message=f"Unusual {option_type.upper()} price move: {price_change_pct:+.1f}% at strike {strike}",
+            severity=severity,
+            data={'price_change_pct': price_change_pct}
+        )
+        self.alerts_buffer.append(alert)
+    
+    def _detect_and_alert_changes(self):
+        """Detect patterns and generate additional alerts"""
+        try:
+            # Detect rapid accumulation
+            self._detect_rapid_accumulation()
+            
+            # Detect sweep patterns
+            self._detect_sweep_patterns()
+            
+            # Detect institutional patterns
+            self._detect_institutional_patterns()
+            
+        except Exception as e:
+            logger.error(f"Error detecting patterns: {e}")
+    
+    def _detect_rapid_accumulation(self):
+        """Detect rapid OI accumulation in real-time"""
+        cutoff_time = datetime.now() - timedelta(seconds=self.rapid_change_window)
+        
+        # Group recent changes by strike and type
+        strike_changes = {}
+        for change in self.oi_changes_buffer:
+            if change['timestamp'] > cutoff_time:
+                key = f"{change['strike']}_{change['type']}"
+                if key not in strike_changes:
+                    strike_changes[key] = []
+                strike_changes[key].append(change)
+        
+        # Check for rapid accumulation
+        for key, changes in strike_changes.items():
+            if len(changes) >= 3:  # Multiple changes in short time
+                total_change = sum(c['oi_change'] for c in changes)
+                if abs(total_change) >= 1500:
+                    strike, option_type = key.split('_')
+                    
+                    # Check if already alerted recently
+                    recent_alerts = [a for a in self.alerts_buffer 
+                                   if a.alert_type == 'RAPID_ACCUMULATION' 
+                                   and a.strike == float(strike)
+                                   and a.timestamp > cutoff_time]
+                    
+                    if not recent_alerts:
+                        alert = RealTimeAlert(
+                            timestamp=datetime.now(),
+                            alert_type='RAPID_ACCUMULATION',
+                            strike=float(strike),
+                            option_type=option_type,
+                            message=f"Rapid {option_type} accumulation: {total_change:+,} in {self.rapid_change_window}s at strike {strike}",
+                            severity='HIGH',
+                            data={
+                                'total_change': total_change,
+                                'change_count': len(changes),
+                                'timeframe': self.rapid_change_window
+                            }
+                        )
+                        self.alerts_buffer.append(alert)
+    
+    def _detect_sweep_patterns(self):
+        """Detect option sweep patterns from WebSocket data"""
+        recent_window = datetime.now() - timedelta(seconds=5)
+        
+        # Check recent high-volume trades
+        for key, data in self.last_data.items():
+            if '_' not in key or 'timestamp' not in data:
+                continue
                 
-                if prev_call:
-                    # OI changes
-                    oi_change = current_call['open_interest'] - prev_call['open_interest']
-                    if abs(oi_change) > 0:
-                        changes['oi_changes'].append({
-                            'strike': current_call['strike_price'],
-                            'type': 'CALL',
-                            'oi_change': oi_change,
-                            'current_oi': current_call['open_interest'],
-                            'prev_oi': prev_call['open_interest'],
-                            'ltp': current_call['ltp'],
-                            'volume': current_call.get('volume', 0)
-                        })
-                    
-                    # Price changes
-                    price_change = current_call['ltp'] - prev_call['ltp']
-                    price_change_pct = (price_change / prev_call['ltp']) * 100 if prev_call['ltp'] > 0 else 0
-                    
-                    if abs(price_change_pct) > self.price_change_threshold * 100:
-                        changes['price_changes'].append({
-                            'strike': current_call['strike_price'],
-                            'type': 'CALL',
-                            'price_change': price_change,
-                            'price_change_pct': price_change_pct,
-                            'current_ltp': current_call['ltp'],
-                            'prev_ltp': prev_call['ltp']
-                        })
-            
-            # Process puts (similar logic)
-            for current_put in current_data['puts']:
-                prev_put = self._find_previous_option(self.last_data['puts'], current_put['strike_price'])
+            if data['timestamp'] > recent_window:
+                volume = data.get('volume', 0)
+                oi = data.get('oi', 0)
                 
-                if prev_put:
-                    # OI changes
-                    oi_change = current_put['open_interest'] - prev_put['open_interest']
-                    if abs(oi_change) > 0:
-                        changes['oi_changes'].append({
-                            'strike': current_put['strike_price'],
-                            'type': 'PUT',
-                            'oi_change': oi_change,
-                            'current_oi': current_put['open_interest'],
-                            'prev_oi': prev_put['open_interest'],
-                            'ltp': current_put['ltp'],
-                            'volume': current_put.get('volume', 0)
-                        })
-                    
-                    # Price changes
-                    price_change = current_put['ltp'] - prev_put['ltp']
-                    price_change_pct = (price_change / prev_put['ltp']) * 100 if prev_put['ltp'] > 0 else 0
-                    
-                    if abs(price_change_pct) > self.price_change_threshold * 100:
-                        changes['price_changes'].append({
-                            'strike': current_put['strike_price'],
-                            'type': 'PUT',
-                            'price_change': price_change,
-                            'price_change_pct': price_change_pct,
-                            'current_ltp': current_put['ltp'],
-                            'prev_ltp': prev_put['ltp']
-                        })
-            
-            # Return changes only if significant
-            if (changes['oi_changes'] or changes['price_changes'] or 
-                abs(changes['spot_change']) > 1):
-                return changes
-            
-            return None
-            
-        except Exception as e:
-            logger.error(f"Error detecting changes: {e}")
-            return None
-    
-    def _find_previous_option(self, prev_options: List[Dict], strike: float) -> Optional[Dict]:
-        """Find previous option data for given strike"""
-        try:
-            for option in prev_options:
-                if option['strike_price'] == strike:
-                    return option
-            return None
-        except Exception as e:
-            logger.error(f"Error finding previous option: {e}")
-            return None
-    
-    def _update_buffers(self, changes: Dict):
-        """Update real-time data buffers"""
-        try:
-            timestamp = changes['timestamp']
-            
-            # Update OI changes buffer
-            for oi_change in changes['oi_changes']:
-                self.oi_changes_buffer.append({
-                    'timestamp': timestamp,
-                    'strike': oi_change['strike'],
-                    'type': oi_change['type'],
-                    'oi_change': oi_change['oi_change'],
-                    'volume': oi_change['volume'],
-                    'ltp': oi_change['ltp']
-                })
-            
-            # Update price changes buffer
-            for price_change in changes['price_changes']:
-                self.price_changes_buffer.append({
-                    'timestamp': timestamp,
-                    'strike': price_change['strike'],
-                    'type': price_change['type'],
-                    'price_change_pct': price_change['price_change_pct'],
-                    'current_ltp': price_change['current_ltp']
-                })
-        except Exception as e:
-            logger.error(f"Error updating buffers: {e}")
-    
-    def _generate_real_time_alerts(self, changes: Dict):
-        """Generate real-time alerts based on changes"""
-        try:
-            timestamp = changes['timestamp']
-            
-            # Large OI change alerts
-            for oi_change in changes['oi_changes']:
-                if abs(oi_change['oi_change']) >= self.oi_change_threshold:
-                    severity = 'HIGH' if abs(oi_change['oi_change']) >= 2000 else 'MEDIUM'
-                    
-                    alert = RealTimeAlert(
-                        timestamp=timestamp,
-                        alert_type='LARGE_OI_CHANGE',
-                        strike=oi_change['strike'],
-                        option_type=oi_change['type'],
-                        message=f"Large {oi_change['type']} OI change: {oi_change['oi_change']:+,} at strike {oi_change['strike']}",
-                        severity=severity,
-                        data=oi_change
-                    )
-                    self.alerts_buffer.append(alert)
-            
-            # Unusual price movement alerts
-            for price_change in changes['price_changes']:
-                if abs(price_change['price_change_pct']) >= 10:  # 10% or more
-                    severity = 'HIGH' if abs(price_change['price_change_pct']) >= 20 else 'MEDIUM'
-                    
-                    alert = RealTimeAlert(
-                        timestamp=timestamp,
-                        alert_type='UNUSUAL_PRICE_MOVE',
-                        strike=price_change['strike'],
-                        option_type=price_change['type'],
-                        message=f"Unusual {price_change['type']} price move: {price_change['price_change_pct']:+.1f}% at strike {price_change['strike']}",
-                        severity=severity,
-                        data=price_change
-                    )
-                    self.alerts_buffer.append(alert)
-            
-            # Rapid accumulation detection
-            rapid_changes = self._detect_rapid_accumulation()
-            for rapid_change in rapid_changes:
-                alert = RealTimeAlert(
-                    timestamp=timestamp,
-                    alert_type='RAPID_ACCUMULATION',
-                    strike=rapid_change['strike'],
-                    option_type=rapid_change['type'],
-                    message=f"Rapid {rapid_change['type']} accumulation: {rapid_change['total_change']:+,} in {rapid_change['timeframe']}s at strike {rapid_change['strike']}",
-                    severity='HIGH',
-                    data=rapid_change
-                )
-                self.alerts_buffer.append(alert)
-        except Exception as e:
-            logger.error(f"Error generating alerts: {e}")
-    
-    def _detect_rapid_accumulation(self) -> List[Dict]:
-        """Detect rapid OI accumulation patterns"""
-        try:
-            cutoff_time = datetime.now() - timedelta(seconds=self.rapid_change_window)
-            
-            # Group recent OI changes by strike and type
-            strike_changes = {}
-            for change in self.oi_changes_buffer:
-                if change['timestamp'] > cutoff_time:
-                    key = f"{change['strike']}_{change['type']}"
-                    if key not in strike_changes:
-                        strike_changes[key] = []
-                    strike_changes[key].append(change)
-            
-            rapid_changes = []
-            for key, changes in strike_changes.items():
-                if len(changes) >= 3:  # At least 3 changes in the window
-                    total_change = sum(c['oi_change'] for c in changes)
-                    if abs(total_change) >= 1500:  # Significant total change
+                # Sweep detection: high volume relative to OI
+                if volume > config.OI_FLOW_THRESHOLDS['sweep_size'] and oi > 0:
+                    volume_oi_ratio = volume / oi
+                    if volume_oi_ratio > 0.5:  # Volume > 50% of OI
                         strike, option_type = key.split('_')
-                        rapid_changes.append({
-                            'strike': float(strike),
-                            'type': option_type,
-                            'total_change': total_change,
-                            'change_count': len(changes),
-                            'timeframe': self.rapid_change_window
-                        })
+                        
+                        # Check if already alerted
+                        recent_sweep_alerts = [a for a in self.alerts_buffer 
+                                             if a.alert_type == 'OPTION_SWEEP' 
+                                             and a.strike == float(strike)
+                                             and a.timestamp > recent_window]
+                        
+                        if not recent_sweep_alerts:
+                            alert = RealTimeAlert(
+                                timestamp=datetime.now(),
+                                alert_type='OPTION_SWEEP',
+                                strike=float(strike),
+                                option_type=option_type,
+                                message=f"Potential {option_type} sweep detected at strike {strike}: Volume {volume:,} ({volume_oi_ratio:.1%} of OI)",
+                                severity='HIGH',
+                                data={
+                                    'volume': volume,
+                                    'oi': oi,
+                                    'volume_oi_ratio': volume_oi_ratio
+                                }
+                            )
+                            self.alerts_buffer.append(alert)
+    
+    def _detect_institutional_patterns(self):
+        """Detect institutional trading patterns"""
+        recent_window = datetime.now() - timedelta(seconds=10)
+        
+        for key, data in self.last_data.items():
+            if '_' not in key or 'timestamp' not in data:
+                continue
             
-            return rapid_changes
-        except Exception as e:
-            logger.error(f"Error detecting rapid accumulation: {e}")
-            return []
+            if data['timestamp'] > recent_window:
+                volume = data.get('volume', 0)
+                bid_ask_spread = data.get('ask', 0) - data.get('bid', 0)
+                
+                # Institutional size detection
+                if volume >= config.OI_FLOW_THRESHOLDS['institutional_size']:
+                    strike, option_type = key.split('_')
+                    
+                    # Check spread tightness (institutional tend to get better spreads)
+                    tight_spread = bid_ask_spread < (data.get('ltp', 1) * 0.02)  # Less than 2% spread
+                    
+                    alert = RealTimeAlert(
+                        timestamp=datetime.now(),
+                        alert_type='INSTITUTIONAL_ACTIVITY',
+                        strike=float(strike),
+                        option_type=option_type,
+                        message=f"Institutional size {option_type} trade at strike {strike}: Volume {volume:,}",
+                        severity='MEDIUM',
+                        data={
+                            'volume': volume,
+                            'tight_spread': tight_spread,
+                            'spread': bid_ask_spread
+                        }
+                    )
+                    self.alerts_buffer.append(alert)
     
     def get_recent_changes(self, seconds: int = 60) -> Dict[str, List]:
         """Get recent changes within specified time window"""
         try:
-            cutoff_time = datetime.now() - timedelta(seconds=seconds)
-            
-            recent_oi = [c for c in self.oi_changes_buffer if c['timestamp'] > cutoff_time]
-            recent_price = [c for c in self.price_changes_buffer if c['timestamp'] > cutoff_time]
-            recent_alerts = [a for a in self.alerts_buffer if a.timestamp > cutoff_time]
-            
-            return {
-                'oi_changes': recent_oi,
-                'price_changes': recent_price,
-                'alerts': recent_alerts
-            }
+            with self.data_lock:
+                cutoff_time = datetime.now() - timedelta(seconds=seconds)
+                
+                recent_oi = [c for c in self.oi_changes_buffer if c['timestamp'] > cutoff_time]
+                recent_price = [c for c in self.price_changes_buffer if c['timestamp'] > cutoff_time]
+                recent_alerts = [a for a in self.alerts_buffer if a.timestamp > cutoff_time]
+                
+                return {
+                    'oi_changes': recent_oi,
+                    'price_changes': recent_price,
+                    'alerts': recent_alerts
+                }
         except Exception as e:
             logger.error(f"Error getting recent changes: {e}")
             return {'oi_changes': [], 'price_changes': [], 'alerts': []}
+    
+    def add_strike_to_monitor(self, strike: float):
+        """Dynamically add a strike to monitor"""
+        if strike not in self.monitored_strikes:
+            self.monitored_strikes.append(strike)
+            
+            if self.is_streaming and self.ws_connected:
+                # Subscribe to the new strike
+                try:
+                    # Subscribe to call
+                    self.breeze.subscribe_feeds(
+                        stock_code=self.symbol,
+                        exchange_code="NFO",
+                        product_type="options",
+                        expiry_date=self.expiry_date,
+                        strike_price=str(strike),
+                        right="Call",
+                        get_exchange_quotes=True,
+                        get_market_depth=False
+                    )
+                    
+                    # Subscribe to put
+                    self.breeze.subscribe_feeds(
+                        stock_code=self.symbol,
+                        exchange_code="NFO",
+                        product_type="options",
+                        expiry_date=self.expiry_date,
+                        strike_price=str(strike),
+                        right="Put",
+                        get_exchange_quotes=True,
+                        get_market_depth=False
+                    )
+                    
+                    logger.info(f"Added strike {strike} to monitoring")
+                except Exception as e:
+                    logger.error(f"Error adding strike {strike}: {e}")
+    
+    def get_connection_status(self) -> Dict[str, Any]:
+        """Get WebSocket connection status"""
+        with self.data_lock:
+            return {
+                'is_streaming': self.is_streaming,
+                'ws_connected': self.ws_connected,
+                'tick_count': self.tick_count,
+                'monitored_strikes': len(self.monitored_strikes),
+                'alerts_count': len(self.alerts_buffer),
+                'buffer_size': len(self.oi_changes_buffer),
+                'last_update': self.last_data.get('spot_timestamp', None)
+            }
+    
+    def get_current_snapshot(self) -> Dict[str, Any]:
+        """Get current market snapshot from WebSocket data"""
+        with self.data_lock:
+            snapshot = {
+                'spot_price': self.last_data.get('spot', 0),
+                'spot_change': self.last_data.get('spot_change', 0),
+                'spot_change_pct': self.last_data.get('spot_change_pct', 0),
+                'options_data': {},
+                'timestamp': datetime.now()
+            }
+            
+            # Add option data
+            for key, data in self.last_data.items():
+                if '_' in key and isinstance(data, dict):
+                    strike, option_type = key.split('_')
+                    if strike not in snapshot['options_data']:
+                        snapshot['options_data'][strike] = {}
+                    snapshot['options_data'][strike][option_type] = data
+            
+            return snapshot
 
-# --- ENHANCED OI FLOW ANALYZER WITH REAL-TIME ---
+# --- ENHANCED OI FLOW ANALYZER WITH WEBSOCKET ---
 class RealTimeOIFlowAnalyzer:
-    """Enhanced OI Flow Analyzer with real-time capabilities"""
+    """Enhanced OI Flow Analyzer with WebSocket real-time capabilities"""
     
     def __init__(self, config: AppConfig):
         self.config = config
@@ -523,66 +691,71 @@ class RealTimeOIFlowAnalyzer:
         self.footprint_buffer: Deque[OIFootprint] = deque(maxlen=10000)
         self.alert_history: List[Dict] = []
         
-        # Real-time components
-        self.streamer: Optional[RealTimeDataStreamer] = None
+        # WebSocket streamer instead of polling
+        self.streamer: Optional[WebSocketDataStreamer] = None
         self.is_real_time_enabled = False
     
     def start_real_time_analysis(self, breeze, symbol: str, expiry_date: str) -> bool:
-        """Start real-time analysis"""
+        """Start WebSocket-based real-time analysis"""
         try:
             if self.streamer:
                 self.streamer.stop_streaming()
             
-            self.streamer = RealTimeDataStreamer(breeze, symbol, expiry_date)
+            # Create WebSocket streamer
+            self.streamer = WebSocketDataStreamer(breeze, symbol, expiry_date)
             success = self.streamer.start_streaming()
             
             if success:
                 self.is_real_time_enabled = True
-                logger.info(f"Real-time analysis started for {symbol}")
+                logger.info(f"WebSocket real-time analysis started for {symbol}")
             
             return success
+        except WebSocketError as e:
+            logger.error(f"WebSocket error: {e}")
+            st.error(f"Failed to start real-time streaming: {e}")
+            return False
         except Exception as e:
-            logger.error(f"Failed to start real-time analysis: {e}")
+            logger.error(f"Failed to start WebSocket analysis: {e}")
+            st.error("Failed to start real-time analysis. Please check your connection.")
             return False
     
     def stop_real_time_analysis(self) -> bool:
-        """Stop real-time analysis"""
+        """Stop WebSocket-based real-time analysis"""
         try:
             if self.streamer:
                 success = self.streamer.stop_streaming()
                 if success:
                     self.is_real_time_enabled = False
-                    logger.info("Real-time analysis stopped")
+                    logger.info("WebSocket real-time analysis stopped")
                 return success
             return True
         except Exception as e:
-            logger.error(f"Failed to stop real-time analysis: {e}")
+            logger.error(f"Failed to stop WebSocket analysis: {e}")
             return False
     
     def get_real_time_status(self) -> Dict[str, Any]:
-        """Get current real-time status"""
+        """Get current WebSocket status"""
         try:
             if not self.streamer:
                 return {
                     'is_streaming': False,
+                    'ws_connected': False,
                     'tick_count': 0,
                     'alerts_count': 0,
-                    'buffer_size': 0
+                    'buffer_size': 0,
+                    'last_update': None
                 }
             
-            return {
-                'is_streaming': self.streamer.is_streaming,
-                'tick_count': self.streamer.tick_count,
-                'alerts_count': len(self.streamer.alerts_buffer),
-                'buffer_size': len(self.streamer.oi_changes_buffer)
-            }
+            return self.streamer.get_connection_status()
         except Exception as e:
-            logger.error(f"Error getting real-time status: {e}")
+            logger.error(f"Error getting WebSocket status: {e}")
             return {
                 'is_streaming': False,
+                'ws_connected': False,
                 'tick_count': 0,
                 'alerts_count': 0,
-                'buffer_size': 0
+                'buffer_size': 0,
+                'last_update': None
             }
     
     def get_real_time_data(self, seconds: int = 60) -> Dict[str, Any]:
@@ -596,6 +769,17 @@ class RealTimeOIFlowAnalyzer:
             logger.error(f"Error getting real-time data: {e}")
             return {'oi_changes': [], 'price_changes': [], 'alerts': []}
     
+    def get_current_market_snapshot(self) -> Dict[str, Any]:
+        """Get current market snapshot from WebSocket"""
+        try:
+            if not self.streamer:
+                return {}
+            
+            return self.streamer.get_current_snapshot()
+        except Exception as e:
+            logger.error(f"Error getting market snapshot: {e}")
+            return {}
+
     # Include all the original methods from EnhancedOIFlowAnalyzer
     def analyze_oi_flow_patterns(self, chain_df: pd.DataFrame, 
                                 spot_price: float,
@@ -1877,8 +2061,8 @@ def create_strategy_payoff(chain_df: pd.DataFrame, spot_price: float) -> go.Figu
 
 # --- REAL-TIME DASHBOARD FUNCTIONS ---
 def create_real_time_dashboard() -> None:
-    """Create real-time monitoring dashboard"""
-    st.subheader("🔴 LIVE - Real-Time OI Flow Monitor")
+    """Create real-time monitoring dashboard with WebSocket support"""
+    st.subheader("🔴 LIVE - Real-Time WebSocket Monitor")
     
     # Initialize analyzer if not exists
     if 'rt_analyzer' not in st.session_state:
@@ -1898,13 +2082,14 @@ def create_real_time_dashboard() -> None:
     col1, col2, col3, col4 = st.columns(4)
     
     status = rt_analyzer.get_real_time_status() if rt_analyzer else {
-        'is_streaming': False, 'tick_count': 0, 'alerts_count': 0, 'buffer_size': 0
+        'is_streaming': False, 'ws_connected': False, 'tick_count': 0, 
+        'alerts_count': 0, 'buffer_size': 0, 'last_update': None
     }
     
     with col1:
-        if status['is_streaming']:
-            st.success("🟢 LIVE STREAMING")
-            st.metric("Ticks Processed", status['tick_count'])
+        if status['is_streaming'] and status['ws_connected']:
+            st.success("🟢 WEBSOCKET LIVE")
+            st.metric("Ticks Received", f"{status['tick_count']:,}")
         elif data_ready:
             st.warning("⚪ READY TO START")
             st.metric("Status", "Ready")
@@ -1914,17 +2099,23 @@ def create_real_time_dashboard() -> None:
     
     with col2:
         st.metric("Live Alerts", status['alerts_count'])
-        if data_ready:
-            st.success("✅ Data Ready")
+        if status.get('last_update'):
+            time_diff = (datetime.now() - status['last_update']).seconds
+            st.caption(f"Last update: {time_diff}s ago")
         else:
-            st.error("❌ Data Missing")
+            st.caption("No updates yet")
     
     with col3:
-        current_time = datetime.now().strftime("%H:%M:%S")
-        st.metric("Current Time", current_time)
+        if status['ws_connected']:
+            st.success("✅ WebSocket Connected")
+        else:
+            st.error("❌ WebSocket Disconnected")
+        st.metric("Strikes Monitored", status.get('monitored_strikes', 0))
     
     with col4:
-        st.metric("Buffer Size", status['buffer_size'])
+        st.metric("Data Buffer", status['buffer_size'])
+        current_time = datetime.now().strftime("%H:%M:%S")
+        st.caption(f"Time: {current_time}")
     
     # Control buttons
     col1, col2, col3 = st.columns(3)
@@ -1932,30 +2123,33 @@ def create_real_time_dashboard() -> None:
     with col1:
         if data_ready:
             if not status['is_streaming']:
-                if st.button("🟢 Start Real-Time", type="primary", use_container_width=True):
+                if st.button("🚀 Start WebSocket", type="primary", use_container_width=True):
                     try:
-                        success = rt_analyzer.start_real_time_analysis(breeze, symbol, expiry)
+                        with st.spinner("Connecting to WebSocket..."):
+                            success = rt_analyzer.start_real_time_analysis(breeze, symbol, expiry)
                         if success:
-                            st.success("Real-time analysis started!")
+                            st.success("WebSocket streaming started!")
                             st.rerun()
                         else:
-                            st.error("Failed to start real-time analysis")
+                            st.error("Failed to start WebSocket streaming")
+                    except WebSocketError as e:
+                        st.error(f"WebSocket Error: {e}")
                     except Exception as e:
                         st.error(f"Error starting real-time: {e}")
                         logger.error(f"Real-time start error: {e}")
             else:
                 st.success("🟢 STREAMING ACTIVE")
         else:
-            st.button("🟢 Start Real-Time", disabled=True, use_container_width=True)
+            st.button("🚀 Start WebSocket", disabled=True, use_container_width=True)
             st.caption("Load options data first")
     
     with col2:
-        if st.button("🔴 Stop Real-Time", use_container_width=True):
+        if st.button("🔴 Stop Streaming", use_container_width=True):
             if rt_analyzer:
                 try:
                     success = rt_analyzer.stop_real_time_analysis()
                     if success:
-                        st.info("Real-time analysis stopped")
+                        st.info("WebSocket streaming stopped")
                         st.rerun()
                 except Exception as e:
                     st.error(f"Error stopping real-time: {e}")
@@ -1972,25 +2166,33 @@ def create_real_time_dashboard() -> None:
                 except Exception as e:
                     st.error(f"Error clearing buffers: {e}")
     
-    # Debug information (optional - remove in production)
-    with st.expander("🔧 Debug Info", expanded=False):
-        st.write("**Session State:**")
-        st.write(f"- RT Enabled: {st.session_state.get('real_time_enabled', False)}")
-        st.write(f"- RT Analyzer: {'✅' if 'rt_analyzer' in st.session_state else '❌'}")
-        st.write(f"- Breeze Connection: {'✅' if breeze else '❌'}")
-        st.write(f"- Symbol: {symbol if symbol else '❌'}")
-        st.write(f"- Expiry: {expiry if expiry else '❌'}")
-        
-        if rt_analyzer:
-            st.write(f"- Analyzer Status: {status}")
-        else:
-            st.write("- Analyzer Status: NOT AVAILABLE")
-    
-    # Real-time alerts display
-    if rt_analyzer and status['is_streaming']:
+    # Real-time data display
+    if rt_analyzer and status['is_streaming'] and status['ws_connected']:
         # Get real-time data
         rt_data = rt_analyzer.get_real_time_data(60)  # Last 60 seconds
         
+        # Live Market Snapshot
+        if rt_analyzer.streamer:
+            snapshot = rt_analyzer.get_current_market_snapshot()
+            if snapshot.get('spot_price'):
+                st.subheader("📈 Live Market Snapshot")
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    st.metric("Spot Price", f"₹{snapshot['spot_price']:,.2f}",
+                             f"{snapshot['spot_change_pct']:+.2f}%")
+                
+                with col2:
+                    total_call_oi_change = sum(c['oi_change'] for c in rt_data['oi_changes'] 
+                                             if c['type'] == 'CALL')
+                    st.metric("Call OI Change (1m)", f"{total_call_oi_change:+,}")
+                
+                with col3:
+                    total_put_oi_change = sum(c['oi_change'] for c in rt_data['oi_changes'] 
+                                            if c['type'] == 'PUT')
+                    st.metric("Put OI Change (1m)", f"{total_put_oi_change:+,}")
+        
+        # Real-time alerts
         if rt_data['alerts']:
             st.subheader("🚨 Live Alerts (Last 60 seconds)")
             
@@ -2014,7 +2216,7 @@ def create_real_time_dashboard() -> None:
         
         # Real-time OI changes visualization
         if rt_data['oi_changes']:
-            st.subheader("📊 Live OI Changes (Last 60 seconds)")
+            st.subheader("📊 Live OI Flow (Last 60 seconds)")
             
             # Aggregate OI changes by strike
             call_changes = {}
@@ -2036,25 +2238,27 @@ def create_real_time_dashboard() -> None:
                 fig = go.Figure()
                 
                 if call_changes:
+                    sorted_strikes = sorted(call_changes.keys())
                     fig.add_trace(go.Bar(
-                        x=list(call_changes.keys()),
-                        y=list(call_changes.values()),
+                        x=sorted_strikes,
+                        y=[call_changes[s] for s in sorted_strikes],
                         name='Call OI Changes',
                         marker_color='red',
                         opacity=0.7
                     ))
                 
                 if put_changes:
+                    sorted_strikes = sorted(put_changes.keys())
                     fig.add_trace(go.Bar(
-                        x=list(put_changes.keys()),
-                        y=list(put_changes.values()),
+                        x=sorted_strikes,
+                        y=[put_changes[s] for s in sorted_strikes],
                         name='Put OI Changes',
                         marker_color='green',
                         opacity=0.7
                     ))
                 
                 fig.update_layout(
-                    title="Real-Time OI Changes (Last 60 seconds)",
+                    title="Real-Time OI Changes (WebSocket Feed)",
                     xaxis_title="Strike Price",
                     yaxis_title="OI Change",
                     height=400,
@@ -2064,26 +2268,37 @@ def create_real_time_dashboard() -> None:
                 st.plotly_chart(fig, use_container_width=True)
         
         # Real-time statistics
-        col1, col2 = st.columns(2)
+        st.subheader("📊 Live Statistics")
+        col1, col2, col3, col4 = st.columns(4)
         
         with col1:
             if rt_data['oi_changes']:
-                total_call_changes = sum(c['oi_change'] for c in rt_data['oi_changes'] if c['type'] == 'CALL')
-                total_put_changes = sum(c['oi_change'] for c in rt_data['oi_changes'] if c['type'] == 'PUT')
-                
-                st.metric("Total Call OI Change", f"{total_call_changes:+,}")
-                st.metric("Total Put OI Change", f"{total_put_changes:+,}")
+                total_oi_changes = len(rt_data['oi_changes'])
+                st.metric("OI Updates (1m)", total_oi_changes)
         
         with col2:
             if rt_data['price_changes']:
-                avg_call_change = np.mean([c['price_change_pct'] for c in rt_data['price_changes'] if c['type'] == 'CALL'] or [0])
-                avg_put_change = np.mean([c['price_change_pct'] for c in rt_data['price_changes'] if c['type'] == 'PUT'] or [0])
-                
-                st.metric("Avg Call Price Change", f"{avg_call_change:+.1f}%")
-                st.metric("Avg Put Price Change", f"{avg_put_change:+.1f}%")
+                significant_moves = len([p for p in rt_data['price_changes'] 
+                                       if abs(p['price_change_pct']) > 5])
+                st.metric("Significant Moves", significant_moves)
+        
+        with col3:
+            high_alerts = len([a for a in rt_data['alerts'] if a.severity == 'HIGH'])
+            st.metric("High Alerts", high_alerts)
+        
+        with col4:
+            sweep_alerts = len([a for a in rt_data['alerts'] if a.alert_type == 'OPTION_SWEEP'])
+            st.metric("Sweep Alerts", sweep_alerts)
     
     else:
-        st.info("Start real-time monitoring to see live data")
+        st.info("Start WebSocket streaming to see live data")
+        st.markdown("""
+        ### 🚀 WebSocket Streaming Benefits:
+        - **Real-time tick data** - No polling delays
+        - **No API rate limits** - Single persistent connection
+        - **Lower latency** - Instant market updates
+        - **Professional grade** - Same technology used by trading systems
+        """)
 
 # --- OI FLOW INTEGRATION FUNCTIONS ---
 def create_oi_flow_dashboard(analyzer: RealTimeOIFlowAnalyzer, 
@@ -2192,7 +2407,7 @@ def _create_oi_footprint_chart(footprints: List[OIFootprint],
 
 # --- MAIN APPLICATION UI ---
 def main():
-    st.title("🚀 Pro Options & Greeks Analyzer - Real-Time Edition")
+    st.title("🚀 Pro Options & Greeks Analyzer - WebSocket Real-Time Edition")
     
     # Initialize session state
     if 'last_fetch_time' not in st.session_state:
@@ -2203,6 +2418,8 @@ def main():
         st.session_state.theme = 'light'
     if 'real_time_enabled' not in st.session_state:
         st.session_state.real_time_enabled = False
+    if 'chain_data_loaded' not in st.session_state:
+        st.session_state.chain_data_loaded = False
     
     # Sidebar Configuration
     with st.sidebar:
@@ -2225,15 +2442,15 @@ def main():
         st.subheader("🔄 Data Mode")
         data_mode = st.radio(
             "Select Data Mode",
-            ["Static (Manual Refresh)", "Auto-Refresh", "Real-Time Streaming"],
-            help="Choose how you want to receive data"
+            ["Static (Manual Refresh)", "Auto-Refresh", "WebSocket Streaming"],
+            help="WebSocket provides real-time tick data without API limits"
         )
         
         # Configure based on mode
         if data_mode == "Auto-Refresh":
             refresh_interval = st.slider("Refresh Interval (seconds)", 10, 300, 60)
             st_autorefresh(interval=refresh_interval * 1000, key="datarefresh")
-        elif data_mode == "Real-Time Streaming":
+        elif data_mode == "WebSocket Streaming":
             st.session_state.real_time_enabled = True
             
             # Auto-initialize analyzer
@@ -2245,46 +2462,49 @@ def main():
                     st.error(f"Failed to initialize analyzer: {e}")
                     logger.error(f"Analyzer initialization error: {e}")
             
-            rt_fetch_interval = st.slider("Fetch Interval (seconds)", 1, 10, 2)
-            config.REALTIME_FETCH_INTERVAL = rt_fetch_interval
+            # Auto-trigger data fetch if not loaded
+            if not st.session_state.chain_data_loaded:
+                st.session_state.run_analysis = True
+            
+            st.info("🌐 WebSocket mode - No API rate limits!")
         else:
             st.session_state.real_time_enabled = False
         
-        # Real-time Status
+        # Real-time Status (WebSocket)
         if st.session_state.real_time_enabled:
-            st.subheader("🔴 Real-Time Status")
+            st.subheader("🌐 WebSocket Status")
             
-            # Initialize analyzer if not exists and we have the required data
-            if 'rt_analyzer' not in st.session_state:
-                st.session_state.rt_analyzer = RealTimeOIFlowAnalyzer(config)
-            
-            rt_analyzer = st.session_state.rt_analyzer
-            
-            # Check if we have the required connection info
-            breeze = st.session_state.get('breeze_connection')
-            symbol = st.session_state.get('current_symbol')
-            expiry = st.session_state.get('current_expiry')
-            
-            if rt_analyzer:
-                status = rt_analyzer.get_real_time_status()
-                if status['is_streaming']:
-                    st.success("🟢 STREAMING LIVE")
-                    st.metric("Ticks", status['tick_count'])
-                    st.metric("Alerts", status['alerts_count'])
-                elif all([breeze, symbol, expiry]):
-                    st.warning("⚪ READY TO START")
-                    if st.button("🚀 Quick Start", key="sidebar_start", use_container_width=True):
-                        success = rt_analyzer.start_real_time_analysis(breeze, symbol, expiry)
-                        if success:
-                            st.success("Started!")
-                            st.rerun()
-                        else:
-                            st.error("Failed to start")
+            if 'rt_analyzer' in st.session_state:
+                rt_analyzer = st.session_state.rt_analyzer
+                
+                # Check if we have the required connection info
+                breeze = st.session_state.get('breeze_connection')
+                symbol = st.session_state.get('current_symbol')
+                expiry = st.session_state.get('current_expiry')
+                
+                if rt_analyzer:
+                    status = rt_analyzer.get_real_time_status()
+                    if status['is_streaming'] and status['ws_connected']:
+                        st.success("🟢 WEBSOCKET LIVE")
+                        st.metric("Ticks", f"{status['tick_count']:,}")
+                        st.metric("Alerts", status['alerts_count'])
+                    elif all([breeze, symbol, expiry]):
+                        st.warning("⚪ READY TO START")
+                        if st.button("🚀 Quick Start", key="sidebar_start", use_container_width=True):
+                            with st.spinner("Connecting..."):
+                                success = rt_analyzer.start_real_time_analysis(breeze, symbol, expiry)
+                            if success:
+                                st.success("Started!")
+                                st.rerun()
+                            else:
+                                st.error("Failed to connect")
+                    else:
+                        st.info("⚪ WAITING FOR DATA")
+                        st.caption("Load options data first")
                 else:
-                    st.info("⚪ WAITING FOR DATA")
-                    st.caption("Load options data first")
+                    st.error("❌ INITIALIZATION FAILED")
             else:
-                st.error("❌ INITIALIZATION FAILED")
+                st.error("❌ Analyzer not initialized")
         
         # Display Settings
         st.subheader("📈 Display Options")
@@ -2355,7 +2575,7 @@ def main():
         st.error(str(e))
         return
     
-    # Expiry Selection
+    # Expiry Selection and Data Mode Display
     col1, col2, col3 = st.columns([2, 2, 1])
     with col1:
         selected_expiry = st.selectbox("📅 Select Expiry", list(expiry_map.keys()))
@@ -2364,12 +2584,12 @@ def main():
     
     with col2:
         # Show data mode and freshness
-        if data_mode == "Real-Time Streaming":
+        if data_mode == "WebSocket Streaming":
             rt_analyzer = st.session_state.get('rt_analyzer')
             if rt_analyzer and rt_analyzer.get_real_time_status()['is_streaming']:
-                st.success("🔴 LIVE DATA STREAMING")
+                st.success("🌐 WEBSOCKET LIVE STREAMING")
             else:
-                st.warning("⚪ REAL-TIME NOT ACTIVE")
+                st.warning("⚪ WEBSOCKET NOT ACTIVE")
         elif st.session_state.last_fetch_time:
             time_diff = (datetime.now() - st.session_state.last_fetch_time).seconds
             st.info(f"Last updated: {st.session_state.last_fetch_time.strftime('%H:%M:%S')} ({time_diff}s ago)")
@@ -2378,14 +2598,22 @@ def main():
         if data_mode == "Static (Manual Refresh)":
             if st.button("🔄 Refresh Data", type="primary", use_container_width=True):
                 st.session_state.run_analysis = True
+        elif data_mode == "WebSocket Streaming":
+            # Add a manual refresh button for WebSocket mode too
+            if st.button("📊 Load Chain", type="primary", use_container_width=True):
+                st.session_state.run_analysis = True
+                st.session_state.chain_data_loaded = False
     
     # Real-Time Dashboard (if enabled and before main analysis)
     if show_real_time_dashboard and st.session_state.real_time_enabled:
         create_real_time_dashboard()
         st.markdown("---")
     
-    # Fetch and analyze data
-    if st.session_state.run_analysis or data_mode == "Auto-Refresh" or data_mode == "Static (Manual Refresh)":
+    # Fetch and analyze data - Updated condition for WebSocket mode
+    if (st.session_state.run_analysis or 
+        data_mode in ["Auto-Refresh", "WebSocket Streaming"] or 
+        (not st.session_state.chain_data_loaded and data_mode == "WebSocket Streaming")):
+        
         try:
             api_expiry_date = expiry_map[selected_expiry]
             raw_data, spot_price = get_options_chain_data_with_retry(breeze, symbol, api_expiry_date)
@@ -2394,6 +2622,10 @@ def main():
                 full_chain_df = process_and_analyze(raw_data, spot_price, selected_expiry)
                 
                 if not full_chain_df.empty:
+                    # Mark data as loaded
+                    st.session_state.chain_data_loaded = True
+                    st.session_state.run_analysis = False  # Reset the flag
+                    
                     # Calculate metrics
                     metrics = calculate_dashboard_metrics(full_chain_df, spot_price)
                     atm_strike = full_chain_df.iloc[(full_chain_df['Strike'] - spot_price).abs().argsort()[:1]]['Strike'].values[0]
@@ -2405,12 +2637,12 @@ def main():
                     st.subheader("📊 Key Metrics Dashboard")
                     
                     # Data mode indicator
-                    if data_mode == "Real-Time Streaming":
+                    if data_mode == "WebSocket Streaming":
                         rt_analyzer = st.session_state.get('rt_analyzer')
                         if rt_analyzer and rt_analyzer.get_real_time_status()['is_streaming']:
-                            st.success("🔴 LIVE DATA - Real-time streaming active with tick-by-tick updates")
+                            st.success("🌐 WEBSOCKET LIVE - Real-time tick data streaming with no API limits")
                         else:
-                            st.warning("⚪ Static snapshot - Start real-time streaming for live updates")
+                            st.warning("⚪ Static snapshot - Start WebSocket streaming for live tick updates")
                     elif data_mode == "Auto-Refresh":
                         st.info(f"🔄 AUTO-REFRESH - Updates every {refresh_interval} seconds")
                     else:
@@ -2493,7 +2725,7 @@ def main():
                     with tab4:
                         if show_volume:
                             st.plotly_chart(create_volume_profile(full_chain_df), use_container_width=True)
-                            
+                    
                             # Volume Statistics
                             total_call_vol = full_chain_df['Call Volume'].sum()
                             total_put_vol = full_chain_df['Put Volume'].sum()
@@ -2937,6 +3169,35 @@ def main():
             logger.error(f"Unexpected error: {e}", exc_info=True)
     else:
         st.info("👆 Select data mode and refresh to load the options chain")
+        
+        # Add informative content for new users
+        with st.expander("📚 Quick Start Guide", expanded=True):
+            st.markdown("""
+            ### Getting Started:
+            
+            1. **Enter Session Token** - Get it from the ICICI Direct API login page
+            2. **Select Symbol** - Choose from NIFTY, BANKNIFTY, etc.
+            3. **Choose Data Mode**:
+               - **Static**: Manual refresh only
+               - **Auto-Refresh**: Updates at set intervals
+               - **WebSocket Streaming**: Real-time tick data with no API limits! 🚀
+            4. **Click Load Chain** to fetch initial data
+            
+            ### Key Features:
+            
+            - **Real-time WebSocket streaming** - Professional-grade live data
+            - **OI Flow Analysis** - Track institutional activity
+            - **Greeks Calculation** - Full options analytics
+            - **Manipulation Detection** - AI-powered alerts
+            - **Historical Tracking** - Monitor trends over time
+            
+            ### WebSocket Advantages:
+            
+            - ✅ No API rate limits
+            - ✅ True real-time tick data
+            - ✅ Lower latency
+            - ✅ Professional trading quality
+            """)
     
     # Footer
     st.markdown("---")
@@ -2945,7 +3206,7 @@ def main():
         <div style='text-align: center'>
             <p>Built with ❤️ using Streamlit | Data from ICICI Direct Breeze API</p>
             <p style='font-size: 0.8em; color: gray;'>
-                🔴 <strong>Real-Time Edition</strong> - Now with tick-by-tick streaming capabilities!<br>
+                🌐 <strong>WebSocket Edition</strong> - Professional real-time streaming with no API limits!<br>
                 Disclaimer: This tool is for educational purposes only. 
                 Please do your own research before making any trading decisions.
             </p>
