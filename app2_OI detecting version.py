@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 from datetime import datetime, timedelta
 import numpy as np
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from streamlit_autorefresh import st_autorefresh
 import time
 from scipy.stats import norm
@@ -14,7 +15,8 @@ import json
 import logging
 from io import BytesIO
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Tuple, Optional, Any, Deque
+from collections import deque
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -29,6 +31,10 @@ class AppConfig:
     CACHE_TTL: int = 3600
     MAX_HISTORICAL_RECORDS: int = 200
     
+    # OI Flow Analysis Configuration
+    OI_FLOW_THRESHOLDS: Dict[str, float] = None
+    OI_FLOW_TIMEFRAMES: Dict[str, Dict[str, int]] = None
+    
     def __post_init__(self):
         if self.SYMBOLS is None:
             self.SYMBOLS = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX"]
@@ -39,6 +45,24 @@ class AppConfig:
                 "FINNIFTY": 50,
                 "MIDCPNIFTY": 25,
                 "SENSEX": 100
+            }
+        if self.OI_FLOW_THRESHOLDS is None:
+            self.OI_FLOW_THRESHOLDS = {
+                'large_oi_change': 0.10,
+                'unusual_volume': 2.5,
+                'rapid_iv_change': 0.05,
+                'concentration_threshold': 0.15,
+                'sweep_size': 100,
+                'institutional_size': 500
+            }
+        if self.OI_FLOW_TIMEFRAMES is None:
+            self.OI_FLOW_TIMEFRAMES = {
+                '5min': {'window': 5, 'periods': 12},
+                '10min': {'window': 10, 'periods': 18},
+                '30min': {'window': 30, 'periods': 16},
+                '1hour': {'window': 60, 'periods': 8},
+                '2hour': {'window': 120, 'periods': 6},
+                'daily': {'window': 390, 'periods': 5}
             }
     
     @classmethod
@@ -68,6 +92,21 @@ st.set_page_config(
 class BreezeAPIError(Exception):
     """Custom exception for Breeze API errors"""
     pass
+
+# --- OI FLOW ANALYSIS DATA STRUCTURES ---
+@dataclass
+class OIFootprint:
+    """Structure to store OI footprint data"""
+    timestamp: datetime
+    strike: float
+    option_type: str
+    oi_change: int
+    volume: int
+    price_change: float
+    bid_ask_spread: float
+    iv_change: float
+    large_trade_indicator: bool
+    aggressor_side: str
 
 # --- HELPER & SETUP FUNCTIONS ---
 def load_credentials() -> Tuple[str, str]:
@@ -251,6 +290,480 @@ def calculate_greeks_vectorized(iv_array: np.ndarray, option_type: str, spot: fl
         logger.error(f"Error calculating Greeks: {e}")
     
     return results.round(4)
+
+# --- ENHANCED OI FLOW ANALYZER CLASS ---
+class EnhancedOIFlowAnalyzer:
+    """Advanced OI Flow Analysis System integrated with existing code"""
+    
+    def __init__(self, config: AppConfig):
+        self.config = config
+        self.thresholds = config.OI_FLOW_THRESHOLDS
+        self.timeframes = config.OI_FLOW_TIMEFRAMES
+        self.footprint_buffer: Deque[OIFootprint] = deque(maxlen=10000)
+        self.alert_history: List[Dict] = []
+        
+    def analyze_oi_flow_patterns(self, chain_df: pd.DataFrame, 
+                                spot_price: float,
+                                timeframe: str = '5min') -> Dict[str, Any]:
+        """Core function to analyze OI flow patterns"""
+        try:
+            # Ensure we have required columns
+            if not self._validate_dataframe(chain_df):
+                logger.warning("Invalid dataframe for OI flow analysis")
+                return self._empty_analysis_results()
+            
+            analysis_results = {
+                'footprints': [],
+                'signals': [],
+                'manipulation_alerts': [],
+                'institutional_activity': [],
+                'market_regime': None,
+                'key_levels': {}
+            }
+            
+            # 1. Detect Large OI Changes
+            footprints = self._detect_oi_footprints(chain_df, spot_price)
+            analysis_results['footprints'] = footprints
+            
+            # 2. Identify Unusual Activity
+            unusual_patterns = self._identify_unusual_patterns(chain_df, footprints)
+            
+            # 3. Detect Manipulation
+            manipulation_signals = self._detect_manipulation_patterns(
+                chain_df, footprints, unusual_patterns
+            )
+            analysis_results['manipulation_alerts'] = manipulation_signals
+            
+            # 4. Track Institutional Flow
+            institutional_flow = self._track_institutional_flow(chain_df, timeframe)
+            analysis_results['institutional_activity'] = institutional_flow
+            
+            # 5. Generate Trading Signals
+            signals = self._generate_oi_based_signals(
+                chain_df, footprints, institutional_flow, spot_price
+            )
+            analysis_results['signals'] = signals
+            
+            # 6. Identify Key Levels
+            key_levels = self._identify_oi_based_levels(chain_df, spot_price)
+            analysis_results['key_levels'] = key_levels
+            
+            # 7. Determine Market Regime
+            regime = self._determine_market_regime(chain_df, footprints)
+            analysis_results['market_regime'] = regime
+            
+            return analysis_results
+            
+        except Exception as e:
+            logger.error(f"Error in OI flow analysis: {e}")
+            return self._empty_analysis_results()
+    
+    def _validate_dataframe(self, df: pd.DataFrame) -> bool:
+        """Validate dataframe has required columns"""
+        required_cols = ['Strike', 'Call OI', 'Put OI', 'Call Chng OI', 
+                        'Put Chng OI', 'Call LTP', 'Put LTP', 'Call Volume', 'Put Volume']
+        return all(col in df.columns for col in required_cols)
+    
+    def _empty_analysis_results(self) -> Dict[str, Any]:
+        """Return empty analysis results structure"""
+        return {
+            'footprints': [],
+            'signals': [],
+            'manipulation_alerts': [],
+            'institutional_activity': [],
+            'market_regime': 'UNKNOWN',
+            'key_levels': {}
+        }
+    
+    def _detect_oi_footprints(self, chain_df: pd.DataFrame, 
+                             spot_price: float) -> List[OIFootprint]:
+        """Detect significant OI changes"""
+        footprints = []
+        
+        for _, row in chain_df.iterrows():
+            # Call options
+            if row['Call OI'] > 0 and abs(row['Call Chng OI']) > 0:
+                oi_change_pct = abs(row['Call Chng OI']) / row['Call OI']
+                
+                if oi_change_pct > self.thresholds['large_oi_change']:
+                    is_large = row['Call Volume'] > self.thresholds['institutional_size']
+                    
+                    # Calculate price change
+                    price_change = 0
+                    if 'Call Prev Close' in chain_df.columns:
+                        price_change = row['Call LTP'] - row['Call Prev Close']
+                    
+                    # Calculate IV change
+                    iv_change = 0
+                    if 'Call IV' in chain_df.columns and 'Call Prev IV' in chain_df.columns:
+                        iv_change = row['Call IV'] - row.get('Call Prev IV', row['Call IV'])
+                    
+                    footprint = OIFootprint(
+                        timestamp=datetime.now(),
+                        strike=row['Strike'],
+                        option_type='CALL',
+                        oi_change=int(row['Call Chng OI']),
+                        volume=int(row['Call Volume']),
+                        price_change=price_change,
+                        bid_ask_spread=0,  # Can be added if bid/ask data available
+                        iv_change=iv_change,
+                        large_trade_indicator=is_large,
+                        aggressor_side='BUY' if row['Call Chng OI'] > 0 else 'SELL'
+                    )
+                    footprints.append(footprint)
+                    self.footprint_buffer.append(footprint)
+            
+            # Put options
+            if row['Put OI'] > 0 and abs(row['Put Chng OI']) > 0:
+                oi_change_pct = abs(row['Put Chng OI']) / row['Put OI']
+                
+                if oi_change_pct > self.thresholds['large_oi_change']:
+                    is_large = row['Put Volume'] > self.thresholds['institutional_size']
+                    
+                    price_change = 0
+                    if 'Put Prev Close' in chain_df.columns:
+                        price_change = row['Put LTP'] - row['Put Prev Close']
+                    
+                    iv_change = 0
+                    if 'Put IV' in chain_df.columns and 'Put Prev IV' in chain_df.columns:
+                        iv_change = row['Put IV'] - row.get('Put Prev IV', row['Put IV'])
+                    
+                    footprint = OIFootprint(
+                        timestamp=datetime.now(),
+                        strike=row['Strike'],
+                        option_type='PUT',
+                        oi_change=int(row['Put Chng OI']),
+                        volume=int(row['Put Volume']),
+                        price_change=price_change,
+                        bid_ask_spread=0,
+                        iv_change=iv_change,
+                        large_trade_indicator=is_large,
+                        aggressor_side='BUY' if row['Put Chng OI'] > 0 else 'SELL'
+                    )
+                    footprints.append(footprint)
+                    self.footprint_buffer.append(footprint)
+        
+        return footprints
+    
+    def _identify_unusual_patterns(self, chain_df: pd.DataFrame, 
+                                 footprints: List[OIFootprint]) -> Dict[str, Any]:
+        """Identify unusual patterns"""
+        patterns = {
+            'sweeps': self._detect_option_sweeps(chain_df),
+            'blocks': self._detect_block_trades(chain_df),
+            'synthetic_positions': self._detect_synthetic_positions(chain_df),
+            'pin_attempts': self._detect_pin_attempts(chain_df, footprints)
+        }
+        return patterns
+    
+    def _detect_option_sweeps(self, chain_df: pd.DataFrame) -> List[Dict]:
+        """Detect option sweeps"""
+        sweeps = []
+        
+        for _, row in chain_df.iterrows():
+            # Call sweeps
+            if row['Call Volume'] > self.thresholds['sweep_size']:
+                if row['Call Volume'] > row['Call OI'] * 0.5:  # Volume > 50% of OI
+                    sweeps.append({
+                        'type': 'CALL_SWEEP',
+                        'strike': row['Strike'],
+                        'volume': row['Call Volume'],
+                        'premium': row['Call LTP'] * row['Call Volume'] * 100,
+                        'direction': 'BULLISH'
+                    })
+            
+            # Put sweeps
+            if row['Put Volume'] > self.thresholds['sweep_size']:
+                if row['Put Volume'] > row['Put OI'] * 0.5:
+                    sweeps.append({
+                        'type': 'PUT_SWEEP',
+                        'strike': row['Strike'],
+                        'volume': row['Put Volume'],
+                        'premium': row['Put LTP'] * row['Put Volume'] * 100,
+                        'direction': 'BEARISH'
+                    })
+        
+        return sweeps
+    
+    def _detect_block_trades(self, chain_df: pd.DataFrame) -> List[Dict]:
+        """Detect block trades"""
+        blocks = []
+        
+        # Define block trade threshold
+        block_threshold = self.thresholds['institutional_size'] * 2
+        
+        for _, row in chain_df.iterrows():
+            if row['Call Volume'] > block_threshold:
+                blocks.append({
+                    'type': 'CALL_BLOCK',
+                    'strike': row['Strike'],
+                    'size': row['Call Volume'],
+                    'premium': row['Call LTP'] * row['Call Volume'] * 100
+                })
+            
+            if row['Put Volume'] > block_threshold:
+                blocks.append({
+                    'type': 'PUT_BLOCK',
+                    'strike': row['Strike'],
+                    'size': row['Put Volume'],
+                    'premium': row['Put LTP'] * row['Put Volume'] * 100
+                })
+        
+        return blocks
+    
+    def _detect_synthetic_positions(self, chain_df: pd.DataFrame) -> List[Dict]:
+        """Detect synthetic positions"""
+        synthetics = []
+        
+        for _, row in chain_df.iterrows():
+            # Synthetic long (Long Call + Short Put at same strike)
+            if row['Call Chng OI'] > 100 and row['Put Chng OI'] < -100:
+                if abs(row['Call Chng OI']) == abs(row['Put Chng OI']):
+                    synthetics.append({
+                        'type': 'SYNTHETIC_LONG',
+                        'strike': row['Strike'],
+                        'size': abs(row['Call Chng OI'])
+                    })
+            
+            # Synthetic short (Short Call + Long Put at same strike)
+            elif row['Call Chng OI'] < -100 and row['Put Chng OI'] > 100:
+                if abs(row['Call Chng OI']) == abs(row['Put Chng OI']):
+                    synthetics.append({
+                        'type': 'SYNTHETIC_SHORT',
+                        'strike': row['Strike'],
+                        'size': abs(row['Put Chng OI'])
+                    })
+        
+        return synthetics
+    
+    def _detect_pin_attempts(self, chain_df: pd.DataFrame, 
+                           footprints: List[OIFootprint]) -> List[Dict]:
+        """Detect potential pin attempts"""
+        pin_attempts = []
+        
+        # Find strikes with highest OI
+        max_call_oi_strike = chain_df.loc[chain_df['Call OI'].idxmax(), 'Strike']
+        max_put_oi_strike = chain_df.loc[chain_df['Put OI'].idxmax(), 'Strike']
+        
+        # Check for concentrated activity around these strikes
+        for strike in [max_call_oi_strike, max_put_oi_strike]:
+            strike_footprints = [fp for fp in footprints if fp.strike == strike]
+            
+            if len(strike_footprints) > 3:  # Multiple transactions
+                pin_attempts.append({
+                    'strike': strike,
+                    'activity_count': len(strike_footprints),
+                    'net_oi_change': sum(fp.oi_change for fp in strike_footprints)
+                })
+        
+        return pin_attempts
+    
+    def _detect_manipulation_patterns(self, chain_df: pd.DataFrame,
+                                    footprints: List[OIFootprint],
+                                    unusual_patterns: Dict) -> List[Dict]:
+        """Detect potential manipulation patterns"""
+        alerts = []
+        
+        # Group footprints by strike
+        strike_footprints = {}
+        for fp in footprints:
+            if fp.strike not in strike_footprints:
+                strike_footprints[fp.strike] = []
+            strike_footprints[fp.strike].append(fp)
+        
+        for strike, fps in strike_footprints.items():
+            if len(fps) >= 2:
+                # Check for pump and dump pattern
+                initial_buildup = sum(fp.oi_change for fp in fps if fp.oi_change > 0)
+                subsequent_unwind = sum(fp.oi_change for fp in fps if fp.oi_change < 0)
+                
+                if initial_buildup > 1000 and abs(subsequent_unwind) > initial_buildup * 0.5:
+                    alerts.append({
+                        'type': 'PUMP_DUMP_ALERT',
+                        'strike': strike,
+                        'severity': 'HIGH',
+                        'buildup_size': initial_buildup,
+                        'unwind_size': abs(subsequent_unwind),
+                        'recommendation': 'AVOID - Potential manipulation detected'
+                    })
+        
+        return alerts
+    
+    def _track_institutional_flow(self, chain_df: pd.DataFrame, 
+                                timeframe: str) -> List[Dict]:
+        """Track institutional flow patterns"""
+        institutional_flows = []
+        
+        # Size thresholds by timeframe
+        size_thresholds = {
+            '5min': 100,
+            '10min': 200,
+            '30min': 500,
+            '1hour': 1000,
+            '2hour': 2000,
+            'daily': 5000
+        }
+        
+        threshold = size_thresholds.get(timeframe, 500)
+        
+        for _, row in chain_df.iterrows():
+            # Call side
+            if row['Call Volume'] > threshold or abs(row['Call Chng OI']) > threshold:
+                flow_type = self._classify_institutional_flow(row, 'CALL')
+                if flow_type:
+                    institutional_flows.append({
+                        'strike': row['Strike'],
+                        'type': 'CALL',
+                        'flow_type': flow_type,
+                        'size': max(row['Call Volume'], abs(row['Call Chng OI'])),
+                        'direction': 'LONG' if row['Call Chng OI'] > 0 else 'SHORT',
+                        'premium_involved': row['Call LTP'] * row['Call Volume'] * 100
+                    })
+            
+            # Put side
+            if row['Put Volume'] > threshold or abs(row['Put Chng OI']) > threshold:
+                flow_type = self._classify_institutional_flow(row, 'PUT')
+                if flow_type:
+                    institutional_flows.append({
+                        'strike': row['Strike'],
+                        'type': 'PUT',
+                        'flow_type': flow_type,
+                        'size': max(row['Put Volume'], abs(row['Put Chng OI'])),
+                        'direction': 'LONG' if row['Put Chng OI'] > 0 else 'SHORT',
+                        'premium_involved': row['Put LTP'] * row['Put Volume'] * 100
+                    })
+        
+        return institutional_flows
+    
+    def _classify_institutional_flow(self, row: pd.Series, option_type: str) -> Optional[str]:
+        """Classify the type of institutional flow"""
+        if option_type == 'CALL':
+            oi_change = row['Call Chng OI']
+            price_change = row.get('Call Price Change', 0)
+            
+            # If we don't have price change, estimate from current data
+            if price_change == 0 and 'Call Prev Close' in row:
+                price_change = row['Call LTP'] - row['Call Prev Close']
+        else:
+            oi_change = row['Put Chng OI']
+            price_change = row.get('Put Price Change', 0)
+            
+            if price_change == 0 and 'Put Prev Close' in row:
+                price_change = row['Put LTP'] - row['Put Prev Close']
+        
+        # Classification
+        if oi_change > 0 and price_change > 0:
+            return 'LONG_BUILDUP'
+        elif oi_change > 0 and price_change < 0:
+            return 'SHORT_BUILDUP'
+        elif oi_change < 0 and price_change > 0:
+            return 'SHORT_COVERING'
+        elif oi_change < 0 and price_change < 0:
+            return 'LONG_UNWINDING'
+        else:
+            return None
+    
+    def _generate_oi_based_signals(self, chain_df: pd.DataFrame,
+                                  footprints: List[OIFootprint],
+                                  institutional_flow: List[Dict],
+                                  spot_price: float) -> List[Dict]:
+        """Generate actionable trading signals"""
+        signals = []
+        
+        # 1. Breakout/Breakdown Signals
+        call_oi_sorted = chain_df.nlargest(5, 'Call OI')
+        for _, row in call_oi_sorted.iterrows():
+            if row['Strike'] > spot_price and row['Strike'] < spot_price * 1.02:
+                if row['Call Chng OI'] < -1000:  # Significant unwinding
+                    signals.append({
+                        'type': 'BREAKOUT',
+                        'strike': row['Strike'],
+                        'action': 'BUY',
+                        'target': row['Strike'] * 1.01,
+                        'stop_loss': spot_price * 0.995,
+                        'strength': 0.8,
+                        'reason': f"Heavy call unwinding at resistance {row['Strike']}"
+                    })
+        
+        # 2. Support Signals
+        put_oi_sorted = chain_df.nlargest(5, 'Put OI')
+        for _, row in put_oi_sorted.iterrows():
+            if row['Strike'] < spot_price and row['Strike'] > spot_price * 0.98:
+                if row['Put Chng OI'] < -1000:  # Significant unwinding
+                    signals.append({
+                        'type': 'BREAKDOWN',
+                        'strike': row['Strike'],
+                        'action': 'SELL',
+                        'target': row['Strike'] * 0.99,
+                        'stop_loss': spot_price * 1.005,
+                        'strength': 0.8,
+                        'reason': f"Heavy put unwinding at support {row['Strike']}"
+                    })
+        
+        # 3. Institutional Flow Signals
+        for flow in institutional_flow:
+            if flow['flow_type'] == 'LONG_BUILDUP' and flow['type'] == 'CALL':
+                signals.append({
+                    'type': 'INSTITUTIONAL_LONG',
+                    'strike': flow['strike'],
+                    'action': 'BUY',
+                    'strength': 0.7,
+                    'reason': f"Institutional call buying at {flow['strike']}"
+                })
+        
+        # Sort by strength
+        signals = sorted(signals, key=lambda x: x['strength'], reverse=True)
+        
+        return signals[:10]
+    
+    def _identify_oi_based_levels(self, chain_df: pd.DataFrame, 
+                                 spot_price: float) -> Dict[str, List[float]]:
+        """Identify key support/resistance levels from OI"""
+        levels = {
+            'resistance': [],
+            'support': [],
+            'max_pain': 0
+        }
+        
+        # Resistance levels (high call OI)
+        call_oi_sorted = chain_df.nlargest(5, 'Call OI')
+        levels['resistance'] = call_oi_sorted[
+            call_oi_sorted['Strike'] > spot_price
+        ]['Strike'].tolist()[:3]
+        
+        # Support levels (high put OI)
+        put_oi_sorted = chain_df.nlargest(5, 'Put OI')
+        levels['support'] = put_oi_sorted[
+            put_oi_sorted['Strike'] < spot_price
+        ]['Strike'].tolist()[:3]
+        
+        return levels
+    
+    def _determine_market_regime(self, chain_df: pd.DataFrame, 
+                               footprints: List[OIFootprint]) -> str:
+        """Determine current market regime"""
+        # Count bullish vs bearish footprints
+        bullish_count = sum(1 for fp in footprints 
+                           if fp.aggressor_side == 'BUY' and fp.option_type == 'CALL')
+        bearish_count = sum(1 for fp in footprints 
+                           if fp.aggressor_side == 'BUY' and fp.option_type == 'PUT')
+        
+        # Calculate PCR
+        total_put_oi = chain_df['Put OI'].sum()
+        total_call_oi = chain_df['Call OI'].sum()
+        pcr = total_put_oi / total_call_oi if total_call_oi > 0 else 1
+        
+        # Determine regime
+        if bullish_count > bearish_count * 1.5 and pcr < 0.8:
+            return 'STRONGLY_BULLISH'
+        elif bullish_count > bearish_count and pcr < 1:
+            return 'BULLISH'
+        elif bearish_count > bullish_count * 1.5 and pcr > 1.2:
+            return 'STRONGLY_BEARISH'
+        elif bearish_count > bullish_count and pcr > 1:
+            return 'BEARISH'
+        else:
+            return 'NEUTRAL'
 
 # --- DATA FETCHING ---
 @st.cache_data(ttl=config.CACHE_TTL, show_spinner="Fetching expiry dates...")
@@ -778,6 +1291,107 @@ def create_strategy_payoff(chain_df: pd.DataFrame, spot_price: float) -> go.Figu
     
     return fig
 
+# --- OI FLOW INTEGRATION FUNCTIONS ---
+def create_oi_flow_dashboard(analyzer: EnhancedOIFlowAnalyzer, 
+                           analysis_results: Dict[str, Any],
+                           chain_df: pd.DataFrame,
+                           spot_price: float) -> None:
+    """Create OI flow dashboard integrated with existing UI"""
+    
+    # Header metrics
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        total_footprints = len(analysis_results['footprints'])
+        st.metric("OI Footprints", total_footprints)
+    
+    with col2:
+        inst_flows = len(analysis_results['institutional_activity'])
+        st.metric("Institutional Flows", inst_flows)
+    
+    with col3:
+        active_signals = len([s for s in analysis_results['signals'] if s['strength'] > 0.7])
+        st.metric("Active Signals", active_signals)
+    
+    with col4:
+        regime = analysis_results['market_regime']
+        regime_color = "🟢" if "BULLISH" in regime else "🔴" if "BEARISH" in regime else "⚪"
+        st.metric("Market Regime", f"{regime_color} {regime}")
+    
+    # Alerts
+    if analysis_results['manipulation_alerts']:
+        st.error("⚠️ Manipulation Alerts Detected!")
+        for alert in analysis_results['manipulation_alerts']:
+            st.warning(f"{alert['type']}: Strike {alert['strike']} - {alert['recommendation']}")
+    
+    # Create visualizations
+    _create_oi_footprint_chart(analysis_results['footprints'], chain_df, spot_price)
+    
+    # Signals table
+    if analysis_results['signals']:
+        st.subheader("📊 Trading Signals")
+        signals_df = pd.DataFrame(analysis_results['signals'])
+        st.dataframe(
+            signals_df.style.background_gradient(subset=['strength'], cmap='RdYlGn'),
+            use_container_width=True
+        )
+
+def _create_oi_footprint_chart(footprints: List[OIFootprint], 
+                              chain_df: pd.DataFrame,
+                              spot_price: float) -> None:
+    """Create OI footprint visualization"""
+    if not footprints:
+        st.info("No significant OI footprints detected")
+        return
+    
+    # Prepare data
+    strikes = sorted(chain_df['Strike'].unique())
+    call_footprint_data = {strike: 0 for strike in strikes}
+    put_footprint_data = {strike: 0 for strike in strikes}
+    
+    for fp in footprints:
+        if fp.strike in strikes:
+            if fp.option_type == 'CALL':
+                call_footprint_data[fp.strike] += fp.oi_change
+            else:
+                put_footprint_data[fp.strike] += fp.oi_change
+    
+    # Create figure
+    fig = go.Figure()
+    
+    # Add call footprints
+    fig.add_trace(go.Bar(
+        x=list(call_footprint_data.keys()),
+        y=list(call_footprint_data.values()),
+        name='Call OI Changes',
+        marker_color='rgba(239, 83, 80, 0.7)',
+        hovertemplate='Strike: %{x}<br>Call OI Change: %{y:,.0f}<extra></extra>'
+    ))
+    
+    # Add put footprints
+    fig.add_trace(go.Bar(
+        x=list(put_footprint_data.keys()),
+        y=list(put_footprint_data.values()),
+        name='Put OI Changes',
+        marker_color='rgba(46, 125, 50, 0.7)',
+        hovertemplate='Strike: %{x}<br>Put OI Change: %{y:,.0f}<extra></extra>'
+    ))
+    
+    # Add spot price line
+    fig.add_vline(x=spot_price, line_width=2, line_dash="solid", 
+                  line_color="blue", annotation_text="Spot")
+    
+    fig.update_layout(
+        title='OI Footprint Analysis',
+        xaxis_title='Strike Price',
+        yaxis_title='OI Change',
+        barmode='group',
+        height=400,
+        hovermode='x unified'
+    )
+    
+    st.plotly_chart(fig, use_container_width=True)
+
 # --- MAIN APPLICATION UI ---
 def main():
     st.title("🚀 Pro Options & Greeks Analyzer")
@@ -824,6 +1438,19 @@ def main():
         # Export Options
         st.subheader("💾 Export Data")
         export_format = st.selectbox("Export Format", ["JSON", "CSV", "Excel"])
+        
+        # OI Flow Quick Stats
+        st.subheader("🔍 OI Flow Quick Stats")
+        if 'oi_analysis_results' in st.session_state:
+            results = st.session_state.oi_analysis_results
+            st.metric("Footprints", len(results['footprints']))
+            st.metric("Alerts", len(results['manipulation_alerts']))
+            st.metric("Regime", results['market_regime'])
+            
+            if results['signals']:
+                st.write("**Top Signal:**")
+                top_signal = results['signals'][0]
+                st.info(f"{top_signal['action']} @ {top_signal.get('strike', 'N/A')}")
     
     # Main Content Area
     if not session_token:
@@ -921,8 +1548,9 @@ def main():
                         st.warning(f"**📅 Days to Expiry:** {days_to_expiry}")
                     
                     # Tabs for different views
-                    tabs = ["📊 OI Analysis", "🔥 Heatmap", "😊 IV Analysis", "📈 Volume", "🧮 Greeks", "📉 Strategy", "⏳ History"]
-                    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(tabs)
+                    tabs = ["📊 OI Analysis", "🔥 Heatmap", "😊 IV Analysis", "📈 Volume", 
+                            "🧮 Greeks", "📉 Strategy", "⏳ History", "🔍 OI Flow"]
+                    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(tabs)
                     
                     with tab1:
                         st.plotly_chart(create_oi_chart(full_chain_df, atm_strike, spot_price, metrics['max_pain']), 
@@ -1082,6 +1710,124 @@ def main():
                             st.plotly_chart(fig2, use_container_width=True)
                         else:
                             st.info("Historical data will be tracked during this session.")
+                    
+                    with tab8:  # OI Flow Analysis Tab
+                        st.subheader("🔍 Advanced OI Flow Analysis")
+                        
+                        # Initialize OI analyzer
+                        if 'oi_analyzer' not in st.session_state:
+                            st.session_state.oi_analyzer = EnhancedOIFlowAnalyzer(config)
+                        
+                        oi_analyzer = st.session_state.oi_analyzer
+                        
+                        # Analysis controls
+                        col1, col2 = st.columns([2, 1])
+                        with col1:
+                            analysis_timeframe = st.selectbox(
+                                "Analysis Timeframe",
+                                ["5min", "10min", "30min", "1hour", "2hour", "daily"],
+                                key="oi_flow_timeframe"
+                            )
+                        
+                        with col2:
+                            if st.button("🔄 Analyze OI Flow", use_container_width=True):
+                                # Run OI flow analysis
+                                with st.spinner("Analyzing OI flow patterns..."):
+                                    oi_analysis_results = oi_analyzer.analyze_oi_flow_patterns(
+                                        full_chain_df, spot_price, analysis_timeframe
+                                    )
+                                    
+                                    # Store results in session state
+                                    st.session_state.oi_analysis_results = oi_analysis_results
+                                    st.session_state.oi_analysis_timestamp = datetime.now()
+                        
+                        # Display results if available
+                        if 'oi_analysis_results' in st.session_state:
+                            results = st.session_state.oi_analysis_results
+                            
+                            # Show analysis timestamp
+                            if 'oi_analysis_timestamp' in st.session_state:
+                                time_diff = (datetime.now() - st.session_state.oi_analysis_timestamp).seconds
+                                st.info(f"Analysis performed {time_diff} seconds ago")
+                            
+                            # Create dashboard
+                            create_oi_flow_dashboard(oi_analyzer, results, full_chain_df, spot_price)
+                            
+                            # Institutional Activity
+                            if results['institutional_activity']:
+                                st.subheader("🏢 Institutional Activity")
+                                inst_df = pd.DataFrame(results['institutional_activity'])
+                                
+                                # Group by flow type
+                                flow_summary = inst_df.groupby('flow_type').agg({
+                                    'size': 'sum',
+                                    'premium_involved': 'sum'
+                                }).round(0)
+                                
+                                col1, col2 = st.columns(2)
+                                with col1:
+                                    st.dataframe(flow_summary, use_container_width=True)
+                                
+                                with col2:
+                                    # Pie chart of flow types
+                                    fig = go.Figure(data=[go.Pie(
+                                        labels=flow_summary.index,
+                                        values=flow_summary['size'],
+                                        hole=0.3
+                                    )])
+                                    fig.update_layout(
+                                        title="Institutional Flow Distribution",
+                                        height=300
+                                    )
+                                    st.plotly_chart(fig, use_container_width=True)
+                            
+                            # Key Levels
+                            if results['key_levels']:
+                                st.subheader("🎯 Key OI-Based Levels")
+                                levels = results['key_levels']
+                                
+                                col1, col2 = st.columns(2)
+                                with col1:
+                                    if levels.get('resistance'):
+                                        st.error(f"🔴 Resistance: {', '.join(map(str, levels['resistance']))}")
+                                
+                                with col2:
+                                    if levels.get('support'):
+                                        st.success(f"🟢 Support: {', '.join(map(str, levels['support']))}")
+                            
+                            # Export OI Analysis
+                            if st.button("📥 Export OI Flow Analysis"):
+                                export_data = {
+                                    'timestamp': datetime.now().isoformat(),
+                                    'symbol': symbol,
+                                    'expiry': selected_expiry,
+                                    'spot_price': spot_price,
+                                    'timeframe': analysis_timeframe,
+                                    'analysis_results': {
+                                        'footprints': [
+                                            {
+                                                'timestamp': fp.timestamp.isoformat(),
+                                                'strike': fp.strike,
+                                                'option_type': fp.option_type,
+                                                'oi_change': fp.oi_change,
+                                                'volume': fp.volume,
+                                                'large_trade': fp.large_trade_indicator,
+                                                'aggressor': fp.aggressor_side
+                                            } for fp in results['footprints']
+                                        ],
+                                        'signals': results['signals'],
+                                        'alerts': results['manipulation_alerts'],
+                                        'institutional_activity': results['institutional_activity'],
+                                        'market_regime': results['market_regime']
+                                    }
+                                }
+                                
+                                st.download_button(
+                                    "Download OI Analysis JSON",
+                                    data=json.dumps(export_data, indent=2),
+                                    file_name=f"oi_flow_analysis_{symbol}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                                    mime="application/json"
+                                )
                     
                     # Options Chain Table
                     st.subheader("📋 Options Chain Data")
@@ -1264,41 +2010,6 @@ def main():
         unsafe_allow_html=True
     )
 
-# --- UNIT TESTS (save as test_options_analyzer.py) ---
-def test_calculate_iv():
-    """Test IV calculation"""
-    iv = calculate_iv('Call', 100, 100, 5, 0.25)
-    assert 0 < iv < 2, "IV should be between 0 and 2"
-
-def test_calculate_greeks_vectorized():
-    """Test vectorized Greeks calculation"""
-    iv_array = np.array([0.2, 0.25, 0.3])
-    strikes = np.array([95, 100, 105])
-    greeks = calculate_greeks_vectorized(iv_array, 'Call', 100, strikes, 0.25)
-    
-    assert len(greeks) == len(strikes), "Greeks output should match strikes length"
-    assert all(-1 <= greeks['delta'].values) and all(greeks['delta'].values <= 1), "Delta should be between -1 and 1"
-
-def test_validate_option_data():
-    """Test option data validation"""
-    # Valid data
-    valid_df = pd.DataFrame({
-        'strike_price': [100, 105, 110],
-        'ltp': [5, 3, 1],
-        'oi': [1000, 2000, 1500],
-        'volume': [100, 200, 150]
-    })
-    assert validate_option_data(valid_df) == True
-    
-    # Invalid data - missing columns
-    invalid_df = pd.DataFrame({
-        'strike_price': [100, 105, 110]
-    })
-    assert validate_option_data(invalid_df) == False
-
 # Run the application
 if __name__ == "__main__":
     main()
-    
-                        
-    
