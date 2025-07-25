@@ -17,6 +17,8 @@ from io import BytesIO
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional, Any, Deque
 from collections import deque
+import threading
+from queue import Queue
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -34,6 +36,11 @@ class AppConfig:
     # OI Flow Analysis Configuration
     OI_FLOW_THRESHOLDS: Dict[str, float] = None
     OI_FLOW_TIMEFRAMES: Dict[str, Dict[str, int]] = None
+    
+    # Real-time Configuration
+    REALTIME_FETCH_INTERVAL: float = 2.0  # seconds
+    REALTIME_BUFFER_SIZE: int = 1000
+    REALTIME_ALERT_BUFFER_SIZE: int = 100
     
     def __post_init__(self):
         if self.SYMBOLS is None:
@@ -82,7 +89,7 @@ logger = logging.getLogger(__name__)
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(
-    page_title="Pro Options Analyzer", 
+    page_title="Pro Options Analyzer - Real-Time", 
     page_icon="🚀", 
     layout="wide",
     initial_sidebar_state="expanded"
@@ -108,192 +115,374 @@ class OIFootprint:
     large_trade_indicator: bool
     aggressor_side: str
 
-# --- HELPER & SETUP FUNCTIONS ---
-def load_credentials() -> Tuple[str, str]:
-    """Load API credentials from secrets or environment"""
-    if 'BREEZE_API_KEY' in st.secrets:
-        return st.secrets["BREEZE_API_KEY"], st.secrets["BREEZE_API_SECRET"]
-    else:
-        load_dotenv()
-        return os.getenv("BREEZE_API_KEY"), os.getenv("BREEZE_API_SECRET")
+@dataclass
+class RealTimeAlert:
+    """Structure for real-time alerts"""
+    timestamp: datetime
+    alert_type: str
+    strike: float
+    option_type: str
+    message: str
+    severity: str
+    data: Dict[str, Any]
 
-def handle_api_error(response: Dict[str, Any]) -> List[Dict]:
-    """Centralized API error handling"""
-    if not response.get('Success'):
-        error_msg = response.get('Error', 'Unknown API error')
-        if 'session' in error_msg.lower():
-            raise BreezeAPIError("Session expired. Please refresh your session token.")
-        elif 'rate limit' in error_msg.lower():
-            raise BreezeAPIError("Rate limit exceeded. Please wait before retrying.")
-        else:
-            raise BreezeAPIError(f"API Error: {error_msg}")
-    return response['Success']
-
-@st.cache_resource(show_spinner="Connecting to Breeze API...")
-def initialize_breeze(api_key: str, api_secret: str, session_token: str) -> Optional[BreezeConnect]:
-    """Initialize Breeze API connection"""
-    try:
-        logger.info("Initializing Breeze connection")
-        breeze = BreezeConnect(api_key=api_key)
-        breeze.generate_session(api_secret=api_secret, session_token=session_token)
-        st.success("API Connection Successful!")
-        return breeze
-    except Exception as e:
-        logger.error(f"Failed to initialize Breeze: {e}")
-        st.error(f"Connection Failed: {e}")
-        return None
-
-def robust_date_parse(date_string: str) -> Optional[datetime]:
-    """Parse dates in multiple formats"""
-    formats = [
-        "%Y-%m-%dT%H:%M:%S.%fZ", 
-        "%d-%b-%Y", 
-        "%Y-%m-%d",
-        "%d-%m-%Y",
-        "%Y%m%d"
-    ]
-    for fmt in formats:
+# --- REAL-TIME DATA STREAMER ---
+class RealTimeDataStreamer:
+    """Real-time data streaming for options analysis"""
+    
+    def __init__(self, breeze_connection, symbol: str, expiry_date: str):
+        self.breeze = breeze_connection
+        self.symbol = symbol
+        self.expiry_date = expiry_date
+        self.is_streaming = False
+        self.streaming_thread = None
+        
+        # Data storage
+        self.data_queue = Queue(maxsize=100)
+        self.last_data = None
+        self.tick_count = 0
+        
+        # Real-time buffers
+        self.oi_changes_buffer: Deque[Dict] = deque(maxlen=config.REALTIME_BUFFER_SIZE)
+        self.price_changes_buffer: Deque[Dict] = deque(maxlen=config.REALTIME_BUFFER_SIZE)
+        self.alerts_buffer: Deque[RealTimeAlert] = deque(maxlen=config.REALTIME_ALERT_BUFFER_SIZE)
+        
+        # Thresholds
+        self.oi_change_threshold = 1000  # Minimum OI change to trigger alert
+        self.price_change_threshold = 0.05  # 5% price change threshold
+        self.rapid_change_window = 30  # 30 seconds for rapid change detection
+        
+    def start_streaming(self):
+        """Start real-time data streaming"""
+        if not self.is_streaming:
+            self.is_streaming = True
+            self.streaming_thread = threading.Thread(target=self._stream_data, daemon=True)
+            self.streaming_thread.start()
+            logger.info(f"Real-time streaming started for {self.symbol}")
+            return True
+        return False
+    
+    def stop_streaming(self):
+        """Stop real-time data streaming"""
+        if self.is_streaming:
+            self.is_streaming = False
+            if self.streaming_thread:
+                self.streaming_thread.join(timeout=5)
+            logger.info(f"Real-time streaming stopped for {self.symbol}")
+            return True
+        return False
+    
+    def _stream_data(self):
+        """Main streaming loop"""
+        consecutive_errors = 0
+        max_consecutive_errors = 5
+        
+        while self.is_streaming:
+            try:
+                # Fetch current snapshot
+                current_data = self._fetch_current_snapshot()
+                
+                if current_data:
+                    # Reset error counter on successful fetch
+                    consecutive_errors = 0
+                    
+                    # Detect changes if we have previous data
+                    if self.last_data:
+                        changes = self._detect_changes(current_data)
+                        if changes:
+                            # Add timestamp and tick number
+                            changes['timestamp'] = datetime.now()
+                            changes['tick_number'] = self.tick_count
+                            
+                            # Store in queue for UI processing
+                            if not self.data_queue.full():
+                                self.data_queue.put(changes)
+                            
+                            # Update buffers and generate alerts
+                            self._update_buffers(changes)
+                            self._generate_real_time_alerts(changes)
+                            
+                            self.tick_count += 1
+                    
+                    # Update last data
+                    self.last_data = current_data
+                else:
+                    consecutive_errors += 1
+                    logger.warning(f"Failed to fetch data, consecutive errors: {consecutive_errors}")
+                
+                # Break if too many consecutive errors
+                if consecutive_errors >= max_consecutive_errors:
+                    logger.error(f"Too many consecutive errors ({consecutive_errors}), stopping stream")
+                    self.is_streaming = False
+                    break
+                
+                # Sleep between fetches
+                time.sleep(config.REALTIME_FETCH_INTERVAL)
+                
+            except Exception as e:
+                consecutive_errors += 1
+                logger.error(f"Streaming error: {e}")
+                if consecutive_errors >= max_consecutive_errors:
+                    self.is_streaming = False
+                    break
+                time.sleep(5)  # Wait longer on error
+    
+    def _fetch_current_snapshot(self) -> Optional[Dict]:
+        """Fetch current options data snapshot"""
         try:
-            return datetime.strptime(date_string, fmt)
-        except (ValueError, TypeError):
-            continue
-    return None
-
-def normalize_column_names(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalize column names from Breeze API response"""
-    column_mapping = {
-        'open_interest': 'oi',
-        'openInterest': 'oi',
-        'open_int': 'oi',
-        'oi_change': 'oi_change',
-        'change_oi': 'oi_change',
-        'changeInOI': 'oi_change',
-        'last_traded_price': 'ltp',
-        'lastPrice': 'ltp',
-        'last_price': 'ltp',
-        'total_qty_traded': 'volume',
-        'totalTradedVolume': 'volume',
-        'traded_volume': 'volume',
-        'volume_traded': 'volume',
-        'strike': 'strike_price',
-        'strikePrice': 'strike_price',
-        'option_type': 'right',
-        'optionType': 'right',
-        'call_put': 'right'
-    }
-    
-    # Rename columns based on mapping
-    df.columns = [col.lower().replace(' ', '_') for col in df.columns]
-    df.rename(columns=column_mapping, inplace=True)
-    
-    # Ensure required columns exist with default values
-    required_columns = ['oi', 'oi_change', 'ltp', 'volume', 'strike_price', 'right']
-    for col in required_columns:
-        if col not in df.columns:
-            logger.warning(f"Column '{col}' not found, creating with default value 0")
-            df[col] = 0
-    
-    return df
-
-def validate_option_data(df: pd.DataFrame) -> bool:
-    """Validate option chain data integrity"""
-    required_cols = ['strike_price', 'ltp', 'oi', 'volume']
-    missing_cols = [col for col in required_cols if col not in df.columns]
-    
-    if missing_cols:
-        logger.warning(f"Missing columns in data: {missing_cols}")
-        return False
-    
-    # Check for data quality
-    if df['ltp'].isna().all() or (df['ltp'] == 0).all():
-        st.warning("No valid LTP data found")
-        return False
-    
-    return True
-
-# --- GREEKS & IV CALCULATION ---
-def black_scholes_price(volatility: float, option_type: str, spot: float, 
-                       strike: float, t: float, r: float) -> float:
-    """Calculate Black-Scholes option price"""
-    if t <= 0 or volatility <= 0:
-        return 0
-    
-    try:
-        d1 = (np.log(spot / strike) + (r + 0.5 * volatility**2) * t) / (volatility * np.sqrt(t))
-        d2 = d1 - volatility * np.sqrt(t)
+            # Fetch call options
+            call_data = self.breeze.get_option_chain_quotes(
+                stock_code=self.symbol,
+                exchange_code="NFO",
+                product_type="options",
+                right="Call",
+                expiry_date=self.expiry_date
+            )
+            
+            # Fetch put options
+            put_data = self.breeze.get_option_chain_quotes(
+                stock_code=self.symbol,
+                exchange_code="NFO",
+                product_type="options",
+                right="Put",
+                expiry_date=self.expiry_date
+            )
+            
+            # Fetch spot price
+            spot_data = self.breeze.get_quotes(
+                stock_code=self.symbol,
+                exchange_code="NSE",
+                product_type="cash"
+            )
+            
+            # Check if all requests succeeded
+            if (call_data.get('Success') and put_data.get('Success') and 
+                spot_data.get('Success')):
+                
+                return {
+                    'calls': call_data['Success'],
+                    'puts': put_data['Success'],
+                    'spot': float(spot_data['Success'][0]['ltp']),
+                    'timestamp': datetime.now()
+                }
+            
+        except Exception as e:
+            logger.error(f"Error fetching snapshot: {e}")
         
-        if option_type == 'Call':
-            return spot * norm.cdf(d1) - strike * np.exp(-r * t) * norm.cdf(d2)
-        else:
-            return strike * np.exp(-r * t) * norm.cdf(-d2) - spot * norm.cdf(-d1)
-    except:
-        return 0
-
-@st.cache_data(max_entries=1000)
-def calculate_iv(option_type: str, spot: float, strike: float, 
-                market_price: float, t: float, r: float = 0.07) -> float:
-    """Calculate implied volatility using optimization"""
-    if t <= 0 or market_price <= 0 or spot <= 0 or strike <= 0:
-        return 0
+        return None
     
-    try:
-        objective = lambda vol: abs(black_scholes_price(vol, option_type, spot, strike, t, r) - market_price)
-        result = minimize_scalar(objective, bounds=(0.001, 5.0), method='bounded')
-        return result.x
-    except:
-        return 0
-
-def calculate_greeks_vectorized(iv_array: np.ndarray, option_type: str, spot: float, 
-                               strikes: np.ndarray, t: float, r: float = 0.07) -> pd.DataFrame:
-    """Vectorized Greeks calculation for better performance"""
-    iv_array = np.array(iv_array)
-    strikes = np.array(strikes)
-    
-    # Initialize results
-    results = pd.DataFrame(index=range(len(strikes)), 
-                          columns=['delta', 'gamma', 'vega', 'theta', 'rho'])
-    results.fillna(0, inplace=True)
-    
-    # Handle edge cases
-    mask = (iv_array > 0) & (t > 0) & (strikes > 0)
-    if not mask.any():
-        return results
-    
-    # Vectorized calculations
-    valid_iv = iv_array[mask]
-    valid_strikes = strikes[mask]
-    
-    try:
-        d1 = (np.log(spot / valid_strikes) + (r + 0.5 * valid_iv**2) * t) / (valid_iv * np.sqrt(t))
-        d2 = d1 - valid_iv * np.sqrt(t)
+    def _detect_changes(self, current_data: Dict) -> Optional[Dict]:
+        """Detect changes from previous snapshot"""
+        if not self.last_data:
+            return None
         
-        gamma = norm.pdf(d1) / (spot * valid_iv * np.sqrt(t))
-        vega = spot * norm.pdf(d1) * np.sqrt(t) / 100
+        changes = {
+            'oi_changes': [],
+            'price_changes': [],
+            'volume_changes': [],
+            'spot_change': current_data['spot'] - self.last_data['spot'],
+            'spot_change_pct': ((current_data['spot'] - self.last_data['spot']) / self.last_data['spot']) * 100
+        }
         
-        if option_type == 'Call':
-            delta = norm.cdf(d1)
-            theta = (-spot * norm.pdf(d1) * valid_iv / (2 * np.sqrt(t)) - 
-                     r * valid_strikes * np.exp(-r * t) * norm.cdf(d2)) / 365
-            rho = valid_strikes * t * np.exp(-r * t) * norm.cdf(d2) / 100
-        else:
-            delta = norm.cdf(d1) - 1
-            theta = (-spot * norm.pdf(d1) * valid_iv / (2 * np.sqrt(t)) + 
-                     r * valid_strikes * np.exp(-r * t) * norm.cdf(-d2)) / 365
-            rho = -valid_strikes * t * np.exp(-r * t) * norm.cdf(-d2) / 100
+        # Process calls
+        for current_call in current_data['calls']:
+            prev_call = self._find_previous_option(self.last_data['calls'], current_call['strike_price'])
+            
+            if prev_call:
+                # OI changes
+                oi_change = current_call['open_interest'] - prev_call['open_interest']
+                if abs(oi_change) > 0:
+                    changes['oi_changes'].append({
+                        'strike': current_call['strike_price'],
+                        'type': 'CALL',
+                        'oi_change': oi_change,
+                        'current_oi': current_call['open_interest'],
+                        'prev_oi': prev_call['open_interest'],
+                        'ltp': current_call['ltp'],
+                        'volume': current_call.get('volume', 0)
+                    })
+                
+                # Price changes
+                price_change = current_call['ltp'] - prev_call['ltp']
+                price_change_pct = (price_change / prev_call['ltp']) * 100 if prev_call['ltp'] > 0 else 0
+                
+                if abs(price_change_pct) > self.price_change_threshold * 100:
+                    changes['price_changes'].append({
+                        'strike': current_call['strike_price'],
+                        'type': 'CALL',
+                        'price_change': price_change,
+                        'price_change_pct': price_change_pct,
+                        'current_ltp': current_call['ltp'],
+                        'prev_ltp': prev_call['ltp']
+                    })
         
-        results.loc[mask, 'delta'] = delta
-        results.loc[mask, 'gamma'] = gamma
-        results.loc[mask, 'vega'] = vega
-        results.loc[mask, 'theta'] = theta
-        results.loc[mask, 'rho'] = rho
-    except Exception as e:
-        logger.error(f"Error calculating Greeks: {e}")
+        # Process puts (similar logic)
+        for current_put in current_data['puts']:
+            prev_put = self._find_previous_option(self.last_data['puts'], current_put['strike_price'])
+            
+            if prev_put:
+                # OI changes
+                oi_change = current_put['open_interest'] - prev_put['open_interest']
+                if abs(oi_change) > 0:
+                    changes['oi_changes'].append({
+                        'strike': current_put['strike_price'],
+                        'type': 'PUT',
+                        'oi_change': oi_change,
+                        'current_oi': current_put['open_interest'],
+                        'prev_oi': prev_put['open_interest'],
+                        'ltp': current_put['ltp'],
+                        'volume': current_put.get('volume', 0)
+                    })
+                
+                # Price changes
+                price_change = current_put['ltp'] - prev_put['ltp']
+                price_change_pct = (price_change / prev_put['ltp']) * 100 if prev_put['ltp'] > 0 else 0
+                
+                if abs(price_change_pct) > self.price_change_threshold * 100:
+                    changes['price_changes'].append({
+                        'strike': current_put['strike_price'],
+                        'type': 'PUT',
+                        'price_change': price_change,
+                        'price_change_pct': price_change_pct,
+                        'current_ltp': current_put['ltp'],
+                        'prev_ltp': prev_put['ltp']
+                    })
+        
+        # Return changes only if significant
+        if (changes['oi_changes'] or changes['price_changes'] or 
+            abs(changes['spot_change']) > 1):
+            return changes
+        
+        return None
     
-    return results.round(4)
+    def _find_previous_option(self, prev_options: List[Dict], strike: float) -> Optional[Dict]:
+        """Find previous option data for given strike"""
+        for option in prev_options:
+            if option['strike_price'] == strike:
+                return option
+        return None
+    
+    def _update_buffers(self, changes: Dict):
+        """Update real-time data buffers"""
+        timestamp = changes['timestamp']
+        
+        # Update OI changes buffer
+        for oi_change in changes['oi_changes']:
+            self.oi_changes_buffer.append({
+                'timestamp': timestamp,
+                'strike': oi_change['strike'],
+                'type': oi_change['type'],
+                'oi_change': oi_change['oi_change'],
+                'volume': oi_change['volume'],
+                'ltp': oi_change['ltp']
+            })
+        
+        # Update price changes buffer
+        for price_change in changes['price_changes']:
+            self.price_changes_buffer.append({
+                'timestamp': timestamp,
+                'strike': price_change['strike'],
+                'type': price_change['type'],
+                'price_change_pct': price_change['price_change_pct'],
+                'current_ltp': price_change['current_ltp']
+            })
+    
+    def _generate_real_time_alerts(self, changes: Dict):
+        """Generate real-time alerts based on changes"""
+        timestamp = changes['timestamp']
+        
+        # Large OI change alerts
+        for oi_change in changes['oi_changes']:
+            if abs(oi_change['oi_change']) >= self.oi_change_threshold:
+                severity = 'HIGH' if abs(oi_change['oi_change']) >= 2000 else 'MEDIUM'
+                
+                alert = RealTimeAlert(
+                    timestamp=timestamp,
+                    alert_type='LARGE_OI_CHANGE',
+                    strike=oi_change['strike'],
+                    option_type=oi_change['type'],
+                    message=f"Large {oi_change['type']} OI change: {oi_change['oi_change']:+,} at strike {oi_change['strike']}",
+                    severity=severity,
+                    data=oi_change
+                )
+                self.alerts_buffer.append(alert)
+        
+        # Unusual price movement alerts
+        for price_change in changes['price_changes']:
+            if abs(price_change['price_change_pct']) >= 10:  # 10% or more
+                severity = 'HIGH' if abs(price_change['price_change_pct']) >= 20 else 'MEDIUM'
+                
+                alert = RealTimeAlert(
+                    timestamp=timestamp,
+                    alert_type='UNUSUAL_PRICE_MOVE',
+                    strike=price_change['strike'],
+                    option_type=price_change['type'],
+                    message=f"Unusual {price_change['type']} price move: {price_change['price_change_pct']:+.1f}% at strike {price_change['strike']}",
+                    severity=severity,
+                    data=price_change
+                )
+                self.alerts_buffer.append(alert)
+        
+        # Rapid accumulation detection
+        rapid_changes = self._detect_rapid_accumulation()
+        for rapid_change in rapid_changes:
+            alert = RealTimeAlert(
+                timestamp=timestamp,
+                alert_type='RAPID_ACCUMULATION',
+                strike=rapid_change['strike'],
+                option_type=rapid_change['type'],
+                message=f"Rapid {rapid_change['type']} accumulation: {rapid_change['total_change']:+,} in {rapid_change['timeframe']}s at strike {rapid_change['strike']}",
+                severity='HIGH',
+                data=rapid_change
+            )
+            self.alerts_buffer.append(alert)
+    
+    def _detect_rapid_accumulation(self) -> List[Dict]:
+        """Detect rapid OI accumulation patterns"""
+        cutoff_time = datetime.now() - timedelta(seconds=self.rapid_change_window)
+        
+        # Group recent OI changes by strike and type
+        strike_changes = {}
+        for change in self.oi_changes_buffer:
+            if change['timestamp'] > cutoff_time:
+                key = f"{change['strike']}_{change['type']}"
+                if key not in strike_changes:
+                    strike_changes[key] = []
+                strike_changes[key].append(change)
+        
+        rapid_changes = []
+        for key, changes in strike_changes.items():
+            if len(changes) >= 3:  # At least 3 changes in the window
+                total_change = sum(c['oi_change'] for c in changes)
+                if abs(total_change) >= 1500:  # Significant total change
+                    strike, option_type = key.split('_')
+                    rapid_changes.append({
+                        'strike': float(strike),
+                        'type': option_type,
+                        'total_change': total_change,
+                        'change_count': len(changes),
+                        'timeframe': self.rapid_change_window
+                    })
+        
+        return rapid_changes
+    
+    def get_recent_changes(self, seconds: int = 60) -> Dict[str, List]:
+        """Get recent changes within specified time window"""
+        cutoff_time = datetime.now() - timedelta(seconds=seconds)
+        
+        recent_oi = [c for c in self.oi_changes_buffer if c['timestamp'] > cutoff_time]
+        recent_price = [c for c in self.price_changes_buffer if c['timestamp'] > cutoff_time]
+        recent_alerts = [a for a in self.alerts_buffer if a.timestamp > cutoff_time]
+        
+        return {
+            'oi_changes': recent_oi,
+            'price_changes': recent_price,
+            'alerts': recent_alerts
+        }
 
-# --- ENHANCED OI FLOW ANALYZER CLASS ---
-class EnhancedOIFlowAnalyzer:
-    """Advanced OI Flow Analysis System integrated with existing code"""
+# --- ENHANCED OI FLOW ANALYZER WITH REAL-TIME ---
+class RealTimeOIFlowAnalyzer:
+    """Enhanced OI Flow Analyzer with real-time capabilities"""
     
     def __init__(self, config: AppConfig):
         self.config = config
@@ -302,6 +491,67 @@ class EnhancedOIFlowAnalyzer:
         self.footprint_buffer: Deque[OIFootprint] = deque(maxlen=10000)
         self.alert_history: List[Dict] = []
         
+        # Real-time components
+        self.streamer: Optional[RealTimeDataStreamer] = None
+        self.is_real_time_enabled = False
+    
+    def start_real_time_analysis(self, breeze, symbol: str, expiry_date: str) -> bool:
+        """Start real-time analysis"""
+        try:
+            if self.streamer:
+                self.streamer.stop_streaming()
+            
+            self.streamer = RealTimeDataStreamer(breeze, symbol, expiry_date)
+            success = self.streamer.start_streaming()
+            
+            if success:
+                self.is_real_time_enabled = True
+                logger.info(f"Real-time analysis started for {symbol}")
+            
+            return success
+        except Exception as e:
+            logger.error(f"Failed to start real-time analysis: {e}")
+            return False
+    
+    def stop_real_time_analysis(self) -> bool:
+        """Stop real-time analysis"""
+        try:
+            if self.streamer:
+                success = self.streamer.stop_streaming()
+                if success:
+                    self.is_real_time_enabled = False
+                    logger.info("Real-time analysis stopped")
+                return success
+            return True
+        except Exception as e:
+            logger.error(f"Failed to stop real-time analysis: {e}")
+            return False
+    
+    def get_real_time_status(self) -> Dict[str, Any]:
+        """Get current real-time status"""
+        if not self.streamer:
+            return {
+                'is_streaming': False,
+                'tick_count': 0,
+                'alerts_count': 0,
+                'buffer_size': 0
+            }
+        
+        return {
+            'is_streaming': self.streamer.is_streaming,
+            'tick_count': self.streamer.tick_count,
+            'alerts_count': len(self.streamer.alerts_buffer),
+            'buffer_size': len(self.streamer.oi_changes_buffer)
+        }
+    
+    def get_real_time_data(self, seconds: int = 60) -> Dict[str, Any]:
+        """Get real-time data for specified time window"""
+        if not self.streamer:
+            return {'oi_changes': [], 'price_changes': [], 'alerts': []}
+        
+        return self.streamer.get_recent_changes(seconds)
+    
+    # Include all the original methods from EnhancedOIFlowAnalyzer
     def analyze_oi_flow_patterns(self, chain_df: pd.DataFrame, 
                                 spot_price: float,
                                 timeframe: str = '5min') -> Dict[str, Any]:
@@ -764,6 +1014,189 @@ class EnhancedOIFlowAnalyzer:
             return 'BEARISH'
         else:
             return 'NEUTRAL'
+
+# --- HELPER & SETUP FUNCTIONS ---
+def load_credentials() -> Tuple[str, str]:
+    """Load API credentials from secrets or environment"""
+    if 'BREEZE_API_KEY' in st.secrets:
+        return st.secrets["BREEZE_API_KEY"], st.secrets["BREEZE_API_SECRET"]
+    else:
+        load_dotenv()
+        return os.getenv("BREEZE_API_KEY"), os.getenv("BREEZE_API_SECRET")
+
+def handle_api_error(response: Dict[str, Any]) -> List[Dict]:
+    """Centralized API error handling"""
+    if not response.get('Success'):
+        error_msg = response.get('Error', 'Unknown API error')
+        if 'session' in error_msg.lower():
+            raise BreezeAPIError("Session expired. Please refresh your session token.")
+        elif 'rate limit' in error_msg.lower():
+            raise BreezeAPIError("Rate limit exceeded. Please wait before retrying.")
+        else:
+            raise BreezeAPIError(f"API Error: {error_msg}")
+    return response['Success']
+
+@st.cache_resource(show_spinner="Connecting to Breeze API...")
+def initialize_breeze(api_key: str, api_secret: str, session_token: str) -> Optional[BreezeConnect]:
+    """Initialize Breeze API connection"""
+    try:
+        logger.info("Initializing Breeze connection")
+        breeze = BreezeConnect(api_key=api_key)
+        breeze.generate_session(api_secret=api_secret, session_token=session_token)
+        st.success("API Connection Successful!")
+        return breeze
+    except Exception as e:
+        logger.error(f"Failed to initialize Breeze: {e}")
+        st.error(f"Connection Failed: {e}")
+        return None
+
+def robust_date_parse(date_string: str) -> Optional[datetime]:
+    """Parse dates in multiple formats"""
+    formats = [
+        "%Y-%m-%dT%H:%M:%S.%fZ", 
+        "%d-%b-%Y", 
+        "%Y-%m-%d",
+        "%d-%m-%Y",
+        "%Y%m%d"
+    ]
+    for fmt in formats:
+        try:
+            return datetime.strptime(date_string, fmt)
+        except (ValueError, TypeError):
+            continue
+    return None
+
+def normalize_column_names(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize column names from Breeze API response"""
+    column_mapping = {
+        'open_interest': 'oi',
+        'openInterest': 'oi',
+        'open_int': 'oi',
+        'oi_change': 'oi_change',
+        'change_oi': 'oi_change',
+        'changeInOI': 'oi_change',
+        'last_traded_price': 'ltp',
+        'lastPrice': 'ltp',
+        'last_price': 'ltp',
+        'total_qty_traded': 'volume',
+        'totalTradedVolume': 'volume',
+        'traded_volume': 'volume',
+        'volume_traded': 'volume',
+        'strike': 'strike_price',
+        'strikePrice': 'strike_price',
+        'option_type': 'right',
+        'optionType': 'right',
+        'call_put': 'right'
+    }
+    
+    # Rename columns based on mapping
+    df.columns = [col.lower().replace(' ', '_') for col in df.columns]
+    df.rename(columns=column_mapping, inplace=True)
+    
+    # Ensure required columns exist with default values
+    required_columns = ['oi', 'oi_change', 'ltp', 'volume', 'strike_price', 'right']
+    for col in required_columns:
+        if col not in df.columns:
+            logger.warning(f"Column '{col}' not found, creating with default value 0")
+            df[col] = 0
+    
+    return df
+
+def validate_option_data(df: pd.DataFrame) -> bool:
+    """Validate option chain data integrity"""
+    required_cols = ['strike_price', 'ltp', 'oi', 'volume']
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    
+    if missing_cols:
+        logger.warning(f"Missing columns in data: {missing_cols}")
+        return False
+    
+    # Check for data quality
+    if df['ltp'].isna().all() or (df['ltp'] == 0).all():
+        st.warning("No valid LTP data found")
+        return False
+    
+    return True
+
+# --- GREEKS & IV CALCULATION ---
+def black_scholes_price(volatility: float, option_type: str, spot: float, 
+                       strike: float, t: float, r: float) -> float:
+    """Calculate Black-Scholes option price"""
+    if t <= 0 or volatility <= 0:
+        return 0
+    
+    try:
+        d1 = (np.log(spot / strike) + (r + 0.5 * volatility**2) * t) / (volatility * np.sqrt(t))
+        d2 = d1 - volatility * np.sqrt(t)
+        
+        if option_type == 'Call':
+            return spot * norm.cdf(d1) - strike * np.exp(-r * t) * norm.cdf(d2)
+        else:
+            return strike * np.exp(-r * t) * norm.cdf(-d2) - spot * norm.cdf(-d1)
+    except:
+        return 0
+
+@st.cache_data(max_entries=1000)
+def calculate_iv(option_type: str, spot: float, strike: float, 
+                market_price: float, t: float, r: float = 0.07) -> float:
+    """Calculate implied volatility using optimization"""
+    if t <= 0 or market_price <= 0 or spot <= 0 or strike <= 0:
+        return 0
+    
+    try:
+        objective = lambda vol: abs(black_scholes_price(vol, option_type, spot, strike, t, r) - market_price)
+        result = minimize_scalar(objective, bounds=(0.001, 5.0), method='bounded')
+        return result.x
+    except:
+        return 0
+
+def calculate_greeks_vectorized(iv_array: np.ndarray, option_type: str, spot: float, 
+                               strikes: np.ndarray, t: float, r: float = 0.07) -> pd.DataFrame:
+    """Vectorized Greeks calculation for better performance"""
+    iv_array = np.array(iv_array)
+    strikes = np.array(strikes)
+    
+    # Initialize results
+    results = pd.DataFrame(index=range(len(strikes)), 
+                          columns=['delta', 'gamma', 'vega', 'theta', 'rho'])
+    results.fillna(0, inplace=True)
+    
+    # Handle edge cases
+    mask = (iv_array > 0) & (t > 0) & (strikes > 0)
+    if not mask.any():
+        return results
+    
+    # Vectorized calculations
+    valid_iv = iv_array[mask]
+    valid_strikes = strikes[mask]
+    
+    try:
+        d1 = (np.log(spot / valid_strikes) + (r + 0.5 * valid_iv**2) * t) / (valid_iv * np.sqrt(t))
+        d2 = d1 - valid_iv * np.sqrt(t)
+        
+        gamma = norm.pdf(d1) / (spot * valid_iv * np.sqrt(t))
+        vega = spot * norm.pdf(d1) * np.sqrt(t) / 100
+        
+        if option_type == 'Call':
+            delta = norm.cdf(d1)
+            theta = (-spot * norm.pdf(d1) * valid_iv / (2 * np.sqrt(t)) - 
+                     r * valid_strikes * np.exp(-r * t) * norm.cdf(d2)) / 365
+            rho = valid_strikes * t * np.exp(-r * t) * norm.cdf(d2) / 100
+        else:
+            delta = norm.cdf(d1) - 1
+            theta = (-spot * norm.pdf(d1) * valid_iv / (2 * np.sqrt(t)) + 
+                     r * valid_strikes * np.exp(-r * t) * norm.cdf(-d2)) / 365
+            rho = -valid_strikes * t * np.exp(-r * t) * norm.cdf(-d2) / 100
+        
+        results.loc[mask, 'delta'] = delta
+        results.loc[mask, 'gamma'] = gamma
+        results.loc[mask, 'vega'] = vega
+        results.loc[mask, 'theta'] = theta
+        results.loc[mask, 'rho'] = rho
+    except Exception as e:
+        logger.error(f"Error calculating Greeks: {e}")
+    
+    return results.round(4)
 
 # --- DATA FETCHING ---
 @st.cache_data(ttl=config.CACHE_TTL, show_spinner="Fetching expiry dates...")
@@ -1291,8 +1724,179 @@ def create_strategy_payoff(chain_df: pd.DataFrame, spot_price: float) -> go.Figu
     
     return fig
 
+# --- REAL-TIME DASHBOARD FUNCTIONS ---
+def create_real_time_dashboard() -> None:
+    """Create real-time monitoring dashboard"""
+    st.subheader("🔴 LIVE - Real-Time OI Flow Monitor")
+    
+    # Real-time status
+    col1, col2, col3, col4 = st.columns(4)
+    
+    # Get real-time analyzer if available
+    rt_analyzer = st.session_state.get('rt_analyzer')
+    status = rt_analyzer.get_real_time_status() if rt_analyzer else {
+        'is_streaming': False, 'tick_count': 0, 'alerts_count': 0, 'buffer_size': 0
+    }
+    
+    with col1:
+        if status['is_streaming']:
+            st.success("🟢 LIVE STREAMING")
+            st.metric("Ticks Processed", status['tick_count'])
+        else:
+            st.error("🔴 STOPPED")
+            st.metric("Ticks Processed", 0)
+    
+    with col2:
+        st.metric("Live Alerts", status['alerts_count'])
+    
+    with col3:
+        current_time = datetime.now().strftime("%H:%M:%S")
+        st.metric("Current Time", current_time)
+    
+    with col4:
+        st.metric("Buffer Size", status['buffer_size'])
+    
+    # Control buttons
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        if st.button("🟢 Start Real-Time", type="primary", use_container_width=True):
+            breeze = st.session_state.get('breeze_connection')
+            symbol = st.session_state.get('current_symbol')
+            expiry = st.session_state.get('current_expiry')
+            
+            if not all([breeze, symbol, expiry]):
+                st.error("Please load options data first")
+                return
+            
+            if 'rt_analyzer' not in st.session_state:
+                st.session_state.rt_analyzer = RealTimeOIFlowAnalyzer(config)
+            
+            success = st.session_state.rt_analyzer.start_real_time_analysis(breeze, symbol, expiry)
+            if success:
+                st.success("Real-time analysis started!")
+                st.rerun()
+            else:
+                st.error("Failed to start real-time analysis")
+    
+    with col2:
+        if st.button("🔴 Stop Real-Time", use_container_width=True):
+            if rt_analyzer:
+                success = rt_analyzer.stop_real_time_analysis()
+                if success:
+                    st.info("Real-time analysis stopped")
+                    st.rerun()
+    
+    with col3:
+        if st.button("🗑️ Clear Buffers", use_container_width=True):
+            if rt_analyzer and rt_analyzer.streamer:
+                rt_analyzer.streamer.oi_changes_buffer.clear()
+                rt_analyzer.streamer.price_changes_buffer.clear()
+                rt_analyzer.streamer.alerts_buffer.clear()
+                st.info("Buffers cleared")
+                st.rerun()
+    
+    # Real-time alerts display
+    if rt_analyzer and status['is_streaming']:
+        # Get real-time data
+        rt_data = rt_analyzer.get_real_time_data(60)  # Last 60 seconds
+        
+        if rt_data['alerts']:
+            st.subheader("🚨 Live Alerts (Last 60 seconds)")
+            
+            # Filter alerts by severity
+            severity_filter = st.selectbox("Filter by Severity", ["ALL", "HIGH", "MEDIUM", "LOW"])
+            
+            filtered_alerts = rt_data['alerts']
+            if severity_filter != "ALL":
+                filtered_alerts = [a for a in filtered_alerts if a.severity == severity_filter]
+            
+            # Display recent alerts
+            for alert in reversed(filtered_alerts[-10:]):  # Show last 10 alerts
+                timestamp = alert.timestamp.strftime("%H:%M:%S")
+                
+                if alert.severity == 'HIGH':
+                    st.error(f"🔥 {timestamp} - {alert.message}")
+                elif alert.severity == 'MEDIUM':
+                    st.warning(f"⚠️ {timestamp} - {alert.message}")
+                else:
+                    st.info(f"ℹ️ {timestamp} - {alert.message}")
+        
+        # Real-time OI changes visualization
+        if rt_data['oi_changes']:
+            st.subheader("📊 Live OI Changes (Last 60 seconds)")
+            
+            # Aggregate OI changes by strike
+            call_changes = {}
+            put_changes = {}
+            
+            for change in rt_data['oi_changes']:
+                strike = change['strike']
+                if change['type'] == 'CALL':
+                    if strike not in call_changes:
+                        call_changes[strike] = 0
+                    call_changes[strike] += change['oi_change']
+                else:
+                    if strike not in put_changes:
+                        put_changes[strike] = 0
+                    put_changes[strike] += change['oi_change']
+            
+            if call_changes or put_changes:
+                # Create real-time chart
+                fig = go.Figure()
+                
+                if call_changes:
+                    fig.add_trace(go.Bar(
+                        x=list(call_changes.keys()),
+                        y=list(call_changes.values()),
+                        name='Call OI Changes',
+                        marker_color='red',
+                        opacity=0.7
+                    ))
+                
+                if put_changes:
+                    fig.add_trace(go.Bar(
+                        x=list(put_changes.keys()),
+                        y=list(put_changes.values()),
+                        name='Put OI Changes',
+                        marker_color='green',
+                        opacity=0.7
+                    ))
+                
+                fig.update_layout(
+                    title="Real-Time OI Changes (Last 60 seconds)",
+                    xaxis_title="Strike Price",
+                    yaxis_title="OI Change",
+                    height=400,
+                    barmode='group'
+                )
+                
+                st.plotly_chart(fig, use_container_width=True)
+        
+        # Real-time statistics
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if rt_data['oi_changes']:
+                total_call_changes = sum(c['oi_change'] for c in rt_data['oi_changes'] if c['type'] == 'CALL')
+                total_put_changes = sum(c['oi_change'] for c in rt_data['oi_changes'] if c['type'] == 'PUT')
+                
+                st.metric("Total Call OI Change", f"{total_call_changes:+,}")
+                st.metric("Total Put OI Change", f"{total_put_changes:+,}")
+        
+        with col2:
+            if rt_data['price_changes']:
+                avg_call_change = np.mean([c['price_change_pct'] for c in rt_data['price_changes'] if c['type'] == 'CALL'])
+                avg_put_change = np.mean([c['price_change_pct'] for c in rt_data['price_changes'] if c['type'] == 'PUT'])
+                
+                st.metric("Avg Call Price Change", f"{avg_call_change:+.1f}%")
+                st.metric("Avg Put Price Change", f"{avg_put_change:+.1f}%")
+    
+    else:
+        st.info("Start real-time monitoring to see live data")
+
 # --- OI FLOW INTEGRATION FUNCTIONS ---
-def create_oi_flow_dashboard(analyzer: EnhancedOIFlowAnalyzer, 
+def create_oi_flow_dashboard(analyzer: RealTimeOIFlowAnalyzer, 
                            analysis_results: Dict[str, Any],
                            chain_df: pd.DataFrame,
                            spot_price: float) -> None:
@@ -1394,7 +1998,7 @@ def _create_oi_footprint_chart(footprints: List[OIFootprint],
 
 # --- MAIN APPLICATION UI ---
 def main():
-    st.title("🚀 Pro Options & Greeks Analyzer")
+    st.title("🚀 Pro Options & Greeks Analyzer - Real-Time Edition")
     
     # Initialize session state
     if 'last_fetch_time' not in st.session_state:
@@ -1403,6 +2007,8 @@ def main():
         st.session_state.run_analysis = False
     if 'theme' not in st.session_state:
         st.session_state.theme = 'light'
+    if 'real_time_enabled' not in st.session_state:
+        st.session_state.real_time_enabled = False
     
     # Sidebar Configuration
     with st.sidebar:
@@ -1416,13 +2022,41 @@ def main():
         
         # Symbol Selection
         symbol = st.selectbox("📊 Select Symbol", config.SYMBOLS)
+        st.session_state.current_symbol = symbol
         
-        # Auto-refresh Settings
-        st.subheader("🔄 Auto-Refresh")
-        auto_refresh = st.checkbox("Enable Auto-Refresh")
-        if auto_refresh:
+        # Mode Selection
+        st.subheader("🔄 Data Mode")
+        data_mode = st.radio(
+            "Select Data Mode",
+            ["Static (Manual Refresh)", "Auto-Refresh", "Real-Time Streaming"],
+            help="Choose how you want to receive data"
+        )
+        
+        # Configure based on mode
+        if data_mode == "Auto-Refresh":
             refresh_interval = st.slider("Refresh Interval (seconds)", 10, 300, 60)
             st_autorefresh(interval=refresh_interval * 1000, key="datarefresh")
+        elif data_mode == "Real-Time Streaming":
+            st.session_state.real_time_enabled = True
+            rt_fetch_interval = st.slider("Fetch Interval (seconds)", 1, 10, 2)
+            config.REALTIME_FETCH_INTERVAL = rt_fetch_interval
+        else:
+            st.session_state.real_time_enabled = False
+        
+        # Real-time Status
+        if st.session_state.real_time_enabled:
+            st.subheader("🔴 Real-Time Status")
+            rt_analyzer = st.session_state.get('rt_analyzer')
+            if rt_analyzer:
+                status = rt_analyzer.get_real_time_status()
+                if status['is_streaming']:
+                    st.success("🟢 STREAMING LIVE")
+                    st.metric("Ticks", status['tick_count'])
+                    st.metric("Alerts", status['alerts_count'])
+                else:
+                    st.warning("⚪ NOT STREAMING")
+            else:
+                st.info("⚪ NOT INITIALIZED")
         
         # Display Settings
         st.subheader("📈 Display Options")
@@ -1430,6 +2064,7 @@ def main():
         show_iv_smile = st.checkbox("Show IV Smile", value=True)
         show_volume = st.checkbox("Show Volume Profile", value=True)
         show_strategy = st.checkbox("Show Strategy Analysis", value=False)
+        show_real_time_dashboard = st.checkbox("Show Real-Time Dashboard", value=st.session_state.real_time_enabled)
         
         # Risk Parameters
         st.subheader("⚡ Risk Parameters")
@@ -1439,9 +2074,9 @@ def main():
         st.subheader("💾 Export Data")
         export_format = st.selectbox("Export Format", ["JSON", "CSV", "Excel"])
         
-        # OI Flow Quick Stats
-        st.subheader("🔍 OI Flow Quick Stats")
+        # Quick Stats
         if 'oi_analysis_results' in st.session_state:
+            st.subheader("🔍 Quick Stats")
             results = st.session_state.oi_analysis_results
             st.metric("Footprints", len(results['footprints']))
             st.metric("Alerts", len(results['manipulation_alerts']))
@@ -1470,6 +2105,9 @@ def main():
     if not breeze:
         return
     
+    # Store breeze connection for real-time use
+    st.session_state.breeze_connection = breeze
+    
     # Fetch Expiry Dates
     try:
         expiry_map = get_expiry_map(breeze, symbol)
@@ -1485,18 +2123,32 @@ def main():
     with col1:
         selected_expiry = st.selectbox("📅 Select Expiry", list(expiry_map.keys()))
         st.session_state.selected_display_date = selected_expiry
+        st.session_state.current_expiry = expiry_map[selected_expiry]
     
     with col2:
-        if st.session_state.last_fetch_time:
+        # Show data mode and freshness
+        if data_mode == "Real-Time Streaming":
+            rt_analyzer = st.session_state.get('rt_analyzer')
+            if rt_analyzer and rt_analyzer.get_real_time_status()['is_streaming']:
+                st.success("🔴 LIVE DATA STREAMING")
+            else:
+                st.warning("⚪ REAL-TIME NOT ACTIVE")
+        elif st.session_state.last_fetch_time:
             time_diff = (datetime.now() - st.session_state.last_fetch_time).seconds
             st.info(f"Last updated: {st.session_state.last_fetch_time.strftime('%H:%M:%S')} ({time_diff}s ago)")
     
     with col3:
-        if st.button("🔄 Refresh Data", type="primary", use_container_width=True):
-            st.session_state.run_analysis = True
+        if data_mode == "Static (Manual Refresh)":
+            if st.button("🔄 Refresh Data", type="primary", use_container_width=True):
+                st.session_state.run_analysis = True
+    
+    # Real-Time Dashboard (if enabled and before main analysis)
+    if show_real_time_dashboard and st.session_state.real_time_enabled:
+        create_real_time_dashboard()
+        st.markdown("---")
     
     # Fetch and analyze data
-    if st.session_state.run_analysis or auto_refresh:
+    if st.session_state.run_analysis or data_mode == "Auto-Refresh" or data_mode == "Static (Manual Refresh)":
         try:
             api_expiry_date = expiry_map[selected_expiry]
             raw_data, spot_price = get_options_chain_data_with_retry(breeze, symbol, api_expiry_date)
@@ -1514,6 +2166,18 @@ def main():
                     
                     # Display Key Metrics
                     st.subheader("📊 Key Metrics Dashboard")
+                    
+                    # Data mode indicator
+                    if data_mode == "Real-Time Streaming":
+                        rt_analyzer = st.session_state.get('rt_analyzer')
+                        if rt_analyzer and rt_analyzer.get_real_time_status()['is_streaming']:
+                            st.success("🔴 LIVE DATA - Real-time streaming active with tick-by-tick updates")
+                        else:
+                            st.warning("⚪ Static snapshot - Start real-time streaming for live updates")
+                    elif data_mode == "Auto-Refresh":
+                        st.info(f"🔄 AUTO-REFRESH - Updates every {refresh_interval} seconds")
+                    else:
+                        st.info("📷 STATIC MODE - Manual refresh required")
                     
                     # First row of metrics
                     col1, col2, col3, col4, col5, col6 = st.columns(6)
@@ -1716,7 +2380,7 @@ def main():
                         
                         # Initialize OI analyzer
                         if 'oi_analyzer' not in st.session_state:
-                            st.session_state.oi_analyzer = EnhancedOIFlowAnalyzer(config)
+                            st.session_state.oi_analyzer = RealTimeOIFlowAnalyzer(config)
                         
                         oi_analyzer = st.session_state.oi_analyzer
                         
@@ -1943,10 +2607,18 @@ def main():
                                     'expiry': selected_expiry,
                                     'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                                     'spot_price': spot_price,
-                                    'metrics': metrics
+                                    'metrics': metrics,
+                                    'data_mode': data_mode
                                 },
                                 'chain_data': export_df.to_dict('records')
                             }
+                            
+                            # Add real-time data if available
+                            if st.session_state.real_time_enabled and 'rt_analyzer' in st.session_state:
+                                rt_analyzer = st.session_state.rt_analyzer
+                                if rt_analyzer.streamer:
+                                    rt_data = rt_analyzer.get_real_time_data(300)  # Last 5 minutes
+                                    export_data_dict['real_time_data'] = rt_data
                             
                             if export_format == "JSON":
                                 json_str = json.dumps(export_data_dict, indent=2, default=str)
@@ -1993,7 +2665,7 @@ def main():
             st.error(f"An unexpected error occurred: {e}")
             logger.error(f"Unexpected error: {e}", exc_info=True)
     else:
-        st.info("👆 Click 'Refresh Data' to load the options chain")
+        st.info("👆 Select data mode and refresh to load the options chain")
     
     # Footer
     st.markdown("---")
@@ -2002,6 +2674,7 @@ def main():
         <div style='text-align: center'>
             <p>Built with ❤️ using Streamlit | Data from ICICI Direct Breeze API</p>
             <p style='font-size: 0.8em; color: gray;'>
+                🔴 <strong>Real-Time Edition</strong> - Now with tick-by-tick streaming capabilities!<br>
                 Disclaimer: This tool is for educational purposes only. 
                 Please do your own research before making any trading decisions.
             </p>
