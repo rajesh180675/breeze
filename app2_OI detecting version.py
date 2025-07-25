@@ -2234,11 +2234,8 @@ def get_expiry_map(_breeze: BreezeConnect, symbol: str) -> Dict[str, str]:
 
 def fetch_data_with_progress(_breeze: BreezeConnect, symbol: str, api_expiry_date: str) -> Tuple[Optional[List], Optional[float]]:
     """Fetch options chain data with progress indicator and proper cleanup"""
-    # Create unique keys for progress elements to avoid conflicts
-    progress_key = f"progress_{datetime.now().timestamp()}"
-    status_key = f"status_{datetime.now().timestamp()}"
-    
-    progress_bar = st.progress(0, key=progress_key)
+    # Remove the key parameter - not supported in all Streamlit versions
+    progress_bar = st.progress(0)
     status_text = st.empty()
     
     try:
@@ -2283,8 +2280,11 @@ def fetch_data_with_progress(_breeze: BreezeConnect, symbol: str, api_expiry_dat
         
     except Exception as e:
         # Ensure cleanup on error
-        progress_bar.empty()
-        status_text.empty()
+        try:
+            progress_bar.empty()
+            status_text.empty()
+        except:
+            pass
         raise e
     finally:
         # Ensure cleanup always happens
@@ -2293,7 +2293,7 @@ def fetch_data_with_progress(_breeze: BreezeConnect, symbol: str, api_expiry_dat
             status_text.empty()
         except:
             pass
-
+            
 def get_options_chain_data_with_retry(_breeze: BreezeConnect, symbol: str, 
                                      api_expiry_date: str, max_retries: int = 3) -> Tuple[Optional[List], Optional[float]]:
     """Fetch options chain data with retry logic"""
