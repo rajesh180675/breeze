@@ -2056,6 +2056,7 @@ def normalize_column_names(df: pd.DataFrame) -> pd.DataFrame:
             'oi_change': 'oi_change',
             'change_oi': 'oi_change',
             'changeInOI': 'oi_change',
+            'chnge_oi': 'oi_change',
             'last_traded_price': 'ltp',
             'lastPrice': 'ltp',
             'last_price': 'ltp',
@@ -2063,6 +2064,7 @@ def normalize_column_names(df: pd.DataFrame) -> pd.DataFrame:
             'totalTradedVolume': 'volume',
             'traded_volume': 'volume',
             'volume_traded': 'volume',
+            'total_quantity_traded': 'volume',
             'strike': 'strike_price',
             'strikePrice': 'strike_price',
             'option_type': 'right',
@@ -2231,8 +2233,12 @@ def get_expiry_map(_breeze: BreezeConnect, symbol: str) -> Dict[str, str]:
         return {}
 
 def fetch_data_with_progress(_breeze: BreezeConnect, symbol: str, api_expiry_date: str) -> Tuple[Optional[List], Optional[float]]:
-    """Fetch options chain data with progress indicator"""
-    progress_bar = st.progress(0)
+    """Fetch options chain data with progress indicator and proper cleanup"""
+    # Create unique keys for progress elements to avoid conflicts
+    progress_key = f"progress_{datetime.now().timestamp()}"
+    status_key = f"status_{datetime.now().timestamp()}"
+    
+    progress_bar = st.progress(0, key=progress_key)
     status_text = st.empty()
     
     try:
@@ -2264,11 +2270,11 @@ def fetch_data_with_progress(_breeze: BreezeConnect, symbol: str, api_expiry_dat
         )
         put_data = handle_api_error(put_data)
         
-        status_text.text("Complete!")
+        status_text.text("Processing data...")
         progress_bar.progress(100)
         
-        # Clear progress indicators
-        time.sleep(0.5)
+        # IMPORTANT: Clear progress indicators immediately
+        time.sleep(0.2)  # Brief pause to show completion
         progress_bar.empty()
         status_text.empty()
         
@@ -2276,9 +2282,17 @@ def fetch_data_with_progress(_breeze: BreezeConnect, symbol: str, api_expiry_dat
         return call_data + put_data, spot_price
         
     except Exception as e:
+        # Ensure cleanup on error
         progress_bar.empty()
         status_text.empty()
         raise e
+    finally:
+        # Ensure cleanup always happens
+        try:
+            progress_bar.empty()
+            status_text.empty()
+        except:
+            pass
 
 def get_options_chain_data_with_retry(_breeze: BreezeConnect, symbol: str, 
                                      api_expiry_date: str, max_retries: int = 3) -> Tuple[Optional[List], Optional[float]]:
@@ -2301,6 +2315,8 @@ def get_options_chain_data_with_retry(_breeze: BreezeConnect, symbol: str,
 def process_and_analyze(raw_data: List[Dict], spot_price: float, expiry_date: str) -> pd.DataFrame:
     """Process raw options data and calculate Greeks with robust error handling"""
     try:
+        logger.info(f"Starting data processing with {len(raw_data)} records")
+        
         if not raw_data:
             st.warning("No options data received.")
             return pd.DataFrame()
@@ -2385,6 +2401,8 @@ def process_and_analyze(raw_data: List[Dict], spot_price: float, expiry_date: st
             'strike_price': 'Strike', 'ltp_put': 'Put LTP', 'oi_change_put': 'Put Chng OI',
             'oi_put': 'Put OI', 'volume_call': 'Call Volume', 'volume_put': 'Put Volume'
         }, inplace=True)
+        
+        logger.info(f"Data processing complete. Chain has {len(chain)} rows")
         
         # Add update timestamp for OI tracker - moved outside to prevent duplicates
         # This is now handled in the main function
@@ -2519,6 +2537,7 @@ def calculate_dashboard_metrics(chain_df: pd.DataFrame, spot_price: float) -> Di
             'total_put_oi': 0
         }
 
+# Continue with visualization functions...
 # --- VISUALIZATION FUNCTIONS ---
 def create_iv_smile_chart(chain_df: pd.DataFrame, spot_price: float) -> Optional[go.Figure]:
     """Create IV smile chart with error handling"""
@@ -3261,6 +3280,8 @@ def main():
             st.session_state.needs_oi_refresh = False
         if 'data_mode' not in st.session_state:
             st.session_state.data_mode = "Static (Manual Refresh)"
+        if 'is_loading' not in st.session_state:
+            st.session_state.is_loading = False
         
         # Sidebar Configuration
         with st.sidebar:
@@ -3289,6 +3310,7 @@ def main():
             st.session_state.data_mode = data_mode
             
             # Configure based on mode - Fixed auto-refresh logic
+            refresh_interval = 60  # Default
             if data_mode == "Auto-Refresh":
                 refresh_interval = st.slider("Refresh Interval (seconds)", 10, 300, 60)
                 # Use a container to control auto-refresh
@@ -3314,6 +3336,13 @@ def main():
                 st.info("🌐 WebSocket mode - No API rate limits!")
             else:
                 st.session_state.real_time_enabled = False
+            
+            # Force Stop Loading button
+            if st.button("🛑 Force Stop Loading", help="Use if the app seems stuck"):
+                st.session_state.is_loading = False
+                st.session_state.run_analysis = False
+                st.session_state.needs_oi_refresh = False
+                st.rerun()
             
             # Real-time Status (WebSocket)
             if st.session_state.real_time_enabled:
@@ -3470,9 +3499,15 @@ def main():
             should_fetch_data = True
             st.session_state.needs_oi_refresh = False
         
+        # Prevent multiple simultaneous fetches
+        if should_fetch_data and st.session_state.is_loading:
+            st.warning("Data is already being fetched. Please wait...")
+            should_fetch_data = False
+        
         # Fetch and analyze data
         if should_fetch_data:
             try:
+                st.session_state.is_loading = True
                 api_expiry_date = expiry_map[selected_expiry]
                 raw_data, spot_price = get_options_chain_data_with_retry(breeze, symbol, api_expiry_date)
                 
@@ -3506,6 +3541,8 @@ def main():
             except Exception as e:
                 st.error(f"An unexpected error occurred: {e}")
                 logger.error(f"Unexpected error: {e}", exc_info=True)
+            finally:
+                st.session_state.is_loading = False
         
         # Display data if available in session state
         if 'current_chain_df' in st.session_state and not st.session_state.current_chain_df.empty:
