@@ -1,9 +1,27 @@
-streamlit
-pandas
-breeze-connect
-python-dotenv
-numpy
-plotly
-streamlit-autorefresh
-scipy
-matplotlib
+# Core dependencies
+streamlit==1.29.0
+pandas==2.1.4
+numpy==1.26.2
+
+# Breeze API
+breeze-connect==1.0.52
+
+# Visualization
+plotly==5.18.0
+
+# Auto-refresh functionality
+streamlit-autorefresh==1.0.1
+
+# Scientific computing
+scipy==1.11.4
+
+# Environment variables
+python-dotenv==1.0.0
+
+# Excel export support
+xlsxwriter==3.1.9
+openpyxl==3.1.2
+
+# Additional dependencies that might be needed
+requests==2.31.0
+urllib3==2.1.0
