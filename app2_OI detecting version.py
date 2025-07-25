@@ -91,8 +91,8 @@ logger = logging.getLogger(__name__)
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(
-    page_title="Pro Options Analyzer - WebSocket Real-Time", 
-    page_icon="🚀", 
+    page_title="Pro Options Analyzer - WebSocket Real-Time",
+    page_icon="🚀",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -142,9 +142,22 @@ class TimeBasedOITracker:
         self.trading_end = dt_time(15, 30)
         self.last_update = None
         self.lock = threading.Lock()  # Thread safety
+        self._last_snapshot_hash = None  # Track last snapshot to prevent duplicates
         
+    def _calculate_snapshot_hash(self, snapshot: Dict) -> str:
+        """Calculate hash of snapshot to detect duplicates"""
+        try:
+            # Create a string representation of key data points
+            key_data = []
+            for strike in sorted(snapshot.keys())[:5]:  # Use first 5 strikes for hash
+                data = snapshot[strike]
+                key_data.append(f"{strike}:{data.get('call_oi', 0)}:{data.get('put_oi', 0)}")
+            return "|".join(key_data)
+        except:
+            return ""
+    
     def add_snapshot(self, chain_df: pd.DataFrame, timestamp: datetime) -> bool:
-        """Add OI snapshot at given timestamp with error handling"""
+        """Add OI snapshot at given timestamp with duplicate prevention"""
         try:
             with self.lock:
                 if chain_df.empty:
@@ -173,8 +186,15 @@ class TimeBasedOITracker:
                         continue
                 
                 if snapshot:
+                    # Check for duplicate snapshot
+                    current_hash = self._calculate_snapshot_hash(snapshot)
+                    if current_hash == self._last_snapshot_hash:
+                        logger.debug("Skipping duplicate snapshot")
+                        return False
+                    
                     self.oi_history[timestamp] = snapshot
                     self.last_update = timestamp
+                    self._last_snapshot_hash = current_hash
                     logger.info(f"Added OI snapshot at {timestamp} with {len(snapshot)} strikes")
                     return True
                 else:
@@ -285,8 +305,7 @@ class TimeBasedOITracker:
             logger.error(f"Error clearing old data: {e}")
 
 # --- ENHANCED OI CHART CREATION ---
-def create_enhanced_oi_chart(chain_df: pd.DataFrame, 
-                            spot_price: float,
+def create_enhanced_oi_chart(chain_df: pd.DataFrame, spot_price: float, 
                             oi_tracker: Optional[TimeBasedOITracker] = None,
                             selected_time_range: str = "Full Day",
                             custom_start_time: Optional[datetime] = None,
@@ -603,11 +622,6 @@ def create_enhanced_oi_analysis_tab(chain_df: pd.DataFrame, spot_price: float, s
         
         oi_tracker = st.session_state.oi_tracker
         
-        # Add current snapshot to tracker
-        snapshot_added = oi_tracker.add_snapshot(chain_df, datetime.now())
-        if not snapshot_added:
-            st.warning("Failed to add current snapshot to OI tracker")
-        
         # Clear old data periodically
         if datetime.now().minute % 30 == 0:  # Every 30 minutes
             oi_tracker.clear_old_data(hours_to_keep=8)
@@ -631,7 +645,8 @@ def create_enhanced_oi_analysis_tab(chain_df: pd.DataFrame, spot_price: float, s
         
         with col3:
             if st.button("🔄 Refresh OI Data", key="refresh_oi"):
-                st.rerun()
+                # Just mark for refresh, don't rerun
+                st.session_state.needs_oi_refresh = True
         
         # Custom time range selector
         custom_start = None
@@ -1471,7 +1486,7 @@ class RealTimeOIFlowAnalyzer:
         except Exception as e:
             logger.error(f"Error getting market snapshot: {e}")
             return {}
-
+    
     # Include all the original methods from EnhancedOIFlowAnalyzer
     def analyze_oi_flow_patterns(self, chain_df: pd.DataFrame, 
                                 spot_price: float,
@@ -2018,8 +2033,8 @@ def initialize_breeze(api_key: str, api_secret: str, session_token: str) -> Opti
 def robust_date_parse(date_string: str) -> Optional[datetime]:
     """Parse dates in multiple formats"""
     formats = [
-        "%Y-%m-%dT%H:%M:%S.%fZ", 
-        "%d-%b-%Y", 
+        "%Y-%m-%dT%H:%M:%S.%fZ",
+        "%d-%b-%Y",
         "%Y-%m-%d",
         "%d-%m-%Y",
         "%Y%m%d"
@@ -2215,8 +2230,7 @@ def get_expiry_map(_breeze: BreezeConnect, symbol: str) -> Dict[str, str]:
         st.error(f"Could not fetch expiry dates: {e}")
         return {}
 
-def fetch_data_with_progress(_breeze: BreezeConnect, symbol: str, 
-                           api_expiry_date: str) -> Tuple[Optional[List], Optional[float]]:
+def fetch_data_with_progress(_breeze: BreezeConnect, symbol: str, api_expiry_date: str) -> Tuple[Optional[List], Optional[float]]:
     """Fetch options chain data with progress indicator"""
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -2267,7 +2281,7 @@ def fetch_data_with_progress(_breeze: BreezeConnect, symbol: str,
         raise e
 
 def get_options_chain_data_with_retry(_breeze: BreezeConnect, symbol: str, 
-                                    api_expiry_date: str, max_retries: int = 3) -> Tuple[Optional[List], Optional[float]]:
+                                     api_expiry_date: str, max_retries: int = 3) -> Tuple[Optional[List], Optional[float]]:
     """Fetch options chain data with retry logic"""
     for attempt in range(max_retries):
         try:
@@ -2372,9 +2386,8 @@ def process_and_analyze(raw_data: List[Dict], spot_price: float, expiry_date: st
             'oi_put': 'Put OI', 'volume_call': 'Call Volume', 'volume_put': 'Put Volume'
         }, inplace=True)
         
-        # Add update timestamp for OI tracker
-        if 'oi_tracker' in st.session_state:
-            st.session_state.oi_tracker.add_snapshot(chain, datetime.now())
+        # Add update timestamp for OI tracker - moved outside to prevent duplicates
+        # This is now handled in the main function
         
         return chain
     except Exception as e:
@@ -2388,8 +2401,14 @@ def calculate_dashboard_metrics(chain_df: pd.DataFrame, spot_price: float) -> Di
         if chain_df.empty:
             logger.warning("Empty dataframe provided to calculate_dashboard_metrics")
             return {
-                'max_pain': 0, 'resistance': [], 'support': [], 'pcr': 0,
-                'net_oi_change': 0, 'sentiment': 0, 'total_call_oi': 0, 'total_put_oi': 0
+                'max_pain': 0,
+                'resistance': [],
+                'support': [],
+                'pcr': 0,
+                'net_oi_change': 0,
+                'sentiment': 0,
+                'total_call_oi': 0,
+                'total_put_oi': 0
             }
         
         # Vectorized Max Pain calculation
@@ -2736,7 +2755,6 @@ def create_greeks_surface(chain_df: pd.DataFrame, greek: str, option_type: str) 
         logger.error(f"Error creating Greeks surface: {e}")
         return None
 
-
 def track_historical_data_efficient(symbol: str, expiry: str, metrics: Dict[str, Any]) -> None:
     """Efficient historical data tracking with compression and error handling"""
     try:
@@ -2921,6 +2939,7 @@ def create_real_time_dashboard() -> None:
                                 success = rt_analyzer.start_real_time_analysis(breeze, symbol, expiry)
                             if success:
                                 st.success("WebSocket streaming started!")
+                                time.sleep(1)
                                 st.rerun()
                             else:
                                 st.error("Failed to start WebSocket streaming")
@@ -2942,6 +2961,7 @@ def create_real_time_dashboard() -> None:
                         success = rt_analyzer.stop_real_time_analysis()
                         if success:
                             st.info("WebSocket streaming stopped")
+                            time.sleep(1)
                             st.rerun()
                     except Exception as e:
                         st.error(f"Error stopping real-time: {e}")
@@ -2954,6 +2974,7 @@ def create_real_time_dashboard() -> None:
                         rt_analyzer.streamer.price_changes_buffer.clear()
                         rt_analyzer.streamer.alerts_buffer.clear()
                         st.info("Buffers cleared")
+                        time.sleep(0.5)
                         st.rerun()
                     except Exception as e:
                         st.error(f"Error clearing buffers: {e}")
@@ -3097,10 +3118,8 @@ def create_real_time_dashboard() -> None:
         st.error(f"Error creating real-time dashboard: {str(e)}")
 
 # --- OI FLOW INTEGRATION FUNCTIONS ---
-def create_oi_flow_dashboard(analyzer: RealTimeOIFlowAnalyzer, 
-                           analysis_results: Dict[str, Any],
-                           chain_df: pd.DataFrame,
-                           spot_price: float) -> None:
+def create_oi_flow_dashboard(analyzer: RealTimeOIFlowAnalyzer, analysis_results: Dict[str, Any], 
+                            chain_df: pd.DataFrame, spot_price: float) -> None:
     """Create OI flow dashboard integrated with existing UI"""
     
     try:
@@ -3155,9 +3174,7 @@ def create_oi_flow_dashboard(analyzer: RealTimeOIFlowAnalyzer,
         logger.error(f"Error in OI flow dashboard: {e}")
         st.error(f"Error creating OI flow dashboard: {str(e)}")
 
-def _create_oi_footprint_chart(footprints: List[OIFootprint], 
-                              chain_df: pd.DataFrame,
-                              spot_price: float) -> None:
+def _create_oi_footprint_chart(footprints: List[OIFootprint], chain_df: pd.DataFrame, spot_price: float) -> None:
     """Create OI footprint visualization with error handling"""
     try:
         if not footprints:
@@ -3240,8 +3257,10 @@ def main():
             st.session_state.real_time_enabled = False
         if 'chain_data_loaded' not in st.session_state:
             st.session_state.chain_data_loaded = False
-        if 'data_fetch_in_progress' not in st.session_state:
-            st.session_state.data_fetch_in_progress = False
+        if 'needs_oi_refresh' not in st.session_state:
+            st.session_state.needs_oi_refresh = False
+        if 'data_mode' not in st.session_state:
+            st.session_state.data_mode = "Static (Manual Refresh)"
         
         # Sidebar Configuration
         with st.sidebar:
@@ -3267,14 +3286,19 @@ def main():
                 ["Static (Manual Refresh)", "Auto-Refresh", "WebSocket Streaming"],
                 help="WebSocket provides real-time tick data without API limits"
             )
+            st.session_state.data_mode = data_mode
             
-            # Configure based on mode
+            # Configure based on mode - Fixed auto-refresh logic
             if data_mode == "Auto-Refresh":
                 refresh_interval = st.slider("Refresh Interval (seconds)", 10, 300, 60)
-                st_autorefresh(interval=refresh_interval * 1000, key="datarefresh")
-                # Trigger data fetch on auto-refresh
-                if not st.session_state.data_fetch_in_progress:
-                    st.session_state.run_analysis = True
+                # Use a container to control auto-refresh
+                auto_refresh_container = st.container()
+                with auto_refresh_container:
+                    # Only trigger refresh if data is loaded
+                    if st.session_state.chain_data_loaded:
+                        count = st_autorefresh(interval=refresh_interval * 1000, limit=100000, key="datarefresh")
+                        if count > 0:
+                            st.session_state.run_analysis = True
             elif data_mode == "WebSocket Streaming":
                 st.session_state.real_time_enabled = True
                 
@@ -3286,10 +3310,6 @@ def main():
                     except Exception as e:
                         st.error(f"Failed to initialize analyzer: {e}")
                         logger.error(f"Analyzer initialization error: {e}")
-                
-                # Auto-trigger data fetch if not loaded
-                if not st.session_state.chain_data_loaded and not st.session_state.data_fetch_in_progress:
-                    st.session_state.run_analysis = True
                 
                 st.info("🌐 WebSocket mode - No API rate limits!")
             else:
@@ -3320,6 +3340,7 @@ def main():
                                     success = rt_analyzer.start_real_time_analysis(breeze, symbol, expiry)
                                 if success:
                                     st.success("Started!")
+                                    time.sleep(1)
                                     st.rerun()
                                 else:
                                     st.error("Failed to connect")
@@ -3426,27 +3447,32 @@ def main():
         with col3:
             if data_mode == "Static (Manual Refresh)":
                 if st.button("🔄 Refresh Data", type="primary", use_container_width=True):
-                    if not st.session_state.data_fetch_in_progress:
-                        st.session_state.run_analysis = True
+                    st.session_state.run_analysis = True
             elif data_mode == "WebSocket Streaming":
                 # Add a manual refresh button for WebSocket mode too
                 if st.button("📊 Load Chain", type="primary", use_container_width=True):
-                    if not st.session_state.data_fetch_in_progress:
-                        st.session_state.run_analysis = True
-                        st.session_state.chain_data_loaded = False
+                    st.session_state.run_analysis = True
         
         # Real-Time Dashboard (if enabled and before main analysis)
         if show_real_time_dashboard and st.session_state.real_time_enabled:
             create_real_time_dashboard()
             st.markdown("---")
         
-        # Fetch and analyze data - Prevent looping
-        if st.session_state.run_analysis and not st.session_state.data_fetch_in_progress:
+        # Fixed data fetching logic - only run when explicitly triggered
+        should_fetch_data = False
+        
+        if st.session_state.run_analysis:
+            should_fetch_data = True
+            st.session_state.run_analysis = False  # Reset immediately
+        elif data_mode == "WebSocket Streaming" and not st.session_state.chain_data_loaded:
+            should_fetch_data = True
+        elif st.session_state.needs_oi_refresh:
+            should_fetch_data = True
+            st.session_state.needs_oi_refresh = False
+        
+        # Fetch and analyze data
+        if should_fetch_data:
             try:
-                # Set fetch in progress flag to prevent re-entry
-                st.session_state.data_fetch_in_progress = True
-                st.session_state.run_analysis = False  # Reset immediately
-                
                 api_expiry_date = expiry_map[selected_expiry]
                 raw_data, spot_price = get_options_chain_data_with_retry(breeze, symbol, api_expiry_date)
                 
@@ -3457,6 +3483,10 @@ def main():
                         # Mark data as loaded
                         st.session_state.chain_data_loaded = True
                         
+                        # Add snapshot to OI tracker only once
+                        if 'oi_tracker' in st.session_state:
+                            st.session_state.oi_tracker.add_snapshot(full_chain_df, datetime.now())
+                        
                         # Calculate metrics
                         metrics = calculate_dashboard_metrics(full_chain_df, spot_price)
                         atm_strike = full_chain_df.iloc[(full_chain_df['Strike'] - spot_price).abs().argsort()[:1]]['Strike'].values[0]
@@ -3464,541 +3494,547 @@ def main():
                         # Track historical data
                         track_historical_data_efficient(symbol, selected_expiry, metrics)
                         
-                        # Display Key Metrics
-                        st.subheader("📊 Key Metrics Dashboard")
+                        # Store data in session state for display
+                        st.session_state.current_chain_df = full_chain_df
+                        st.session_state.current_metrics = metrics
+                        st.session_state.current_spot_price = spot_price
+                        st.session_state.current_atm_strike = atm_strike
                         
-                        # Data mode indicator
-                        if data_mode == "WebSocket Streaming":
-                            rt_analyzer = st.session_state.get('rt_analyzer')
-                            if rt_analyzer and rt_analyzer.get_real_time_status()['is_streaming']:
-                                st.success("🌐 WEBSOCKET LIVE - Real-time tick data streaming with no API limits")
-                            else:
-                                st.warning("⚪ Static snapshot - Start WebSocket streaming for live tick updates")
-                        elif data_mode == "Auto-Refresh":
-                            st.info(f"🔄 AUTO-REFRESH - Updates every {refresh_interval} seconds")
-                        else:
-                            st.info("📷 STATIC MODE - Manual refresh required")
-                        
-                        # First row of metrics
-                        col1, col2, col3, col4, col5, col6 = st.columns(6)
-                        
-                        with col1:
-                            st.metric("Spot Price", f"₹{spot_price:,.2f}")
-                        with col2:
-                            st.metric("ATM Strike", f"₹{atm_strike:,.0f}")
-                        with col3:
-                            st.metric("Max Pain", f"₹{metrics['max_pain']:,.0f}")
-                        with col4:
-                            st.metric("PCR", f"{metrics['pcr']:.2f}")
-                        with col5:
-                            net_oi_delta = f"{metrics['net_oi_change']:+,.0f}"
-                            st.metric("Net OI Δ", net_oi_delta)
-                        with col6:
-                            sentiment_text = "Bullish" if metrics['sentiment'] > 20 else "Bearish" if metrics['sentiment'] < -20 else "Neutral"
-                            st.metric("Sentiment", sentiment_text, f"{metrics['sentiment']:.0f}")
-                        
-                        # Sentiment Gauge
-                        col1, col2 = st.columns([1, 2])
-                        with col1:
-                            st.plotly_chart(display_sentiment_gauge(metrics['sentiment']), use_container_width=True)
-                        
-                        with col2:
-                            # Support & Resistance Levels
-                            st.info(f"**🔴 Key Resistance:** {', '.join(map(str, metrics['resistance']))}")
-                            st.success(f"**🟢 Key Support:** {', '.join(map(str, metrics['support']))}")
-                            
-                            # Additional insights
-                            days_to_expiry = (datetime.strptime(selected_expiry, "%d-%b-%Y") - datetime.now()).days
-                            st.warning(f"**📅 Days to Expiry:** {days_to_expiry}")
-                        
-                        # Tabs for different views - Replace the first tab with enhanced OI analysis
-                        tabs = ["📊 OI Analysis", "🔥 Heatmap", "😊 IV Analysis", "📈 Volume", 
-                                "🧮 Greeks", "📉 Strategy", "⏳ History", "🔍 OI Flow"]
-                        tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(tabs)
-                        
-                        with tab1:  # Enhanced OI Analysis tab
-                            create_enhanced_oi_analysis_tab(full_chain_df, spot_price, symbol)
-                        
-                        with tab2:
-                            st.plotly_chart(create_heatmap(full_chain_df), use_container_width=True)
-                        
-                        with tab3:
-                            if show_iv_smile and 'Call IV' in full_chain_df.columns:
-                                iv_chart = create_iv_smile_chart(full_chain_df, spot_price)
-                                if iv_chart:
-                                    st.plotly_chart(iv_chart, use_container_width=True)
-                                    
-                                    # IV Statistics
-                                    col1, col2 = st.columns(2)
-                                    with col1:
-                                        st.metric("Avg Call IV", f"{full_chain_df['Call IV'].mean():.1f}%")
-                                        st.metric("ATM Call IV", f"{full_chain_df.loc[full_chain_df['Strike'] == atm_strike, 'Call IV'].values[0]:.1f}%")
-                                    with col2:
-                                        st.metric("Avg Put IV", f"{full_chain_df['Put IV'].mean():.1f}%")
-                                        st.metric("ATM Put IV", f"{full_chain_df.loc[full_chain_df['Strike'] == atm_strike, 'Put IV'].values[0]:.1f}%")
-                                else:
-                                    st.info("IV Smile chart not available")
-                        
-                        with tab4:
-                            if show_volume:
-                                st.plotly_chart(create_volume_profile(full_chain_df), use_container_width=True)
-                                
-                                # Volume Statistics
-                                total_call_vol = full_chain_df['Call Volume'].sum()
-                                total_put_vol = full_chain_df['Put Volume'].sum()
-                                vol_ratio = total_put_vol / total_call_vol if total_call_vol > 0 else 0
-                                
-                                col1, col2, col3 = st.columns(3)
-                                with col1:
-                                    st.metric("Total Call Volume", f"{total_call_vol:,.0f}")
-                                with col2:
-                                    st.metric("Total Put Volume", f"{total_put_vol:,.0f}")
-                                with col3:
-                                    st.metric("Put/Call Volume Ratio", f"{vol_ratio:.2f}")
-                        
-                        with tab5:
-                            if show_greeks and 'call_delta' in full_chain_df.columns:
-                                # Greeks visualization options
-                                greek_col1, greek_col2 = st.columns(2)
-                                with greek_col1:
-                                    selected_greek = st.selectbox("Select Greek", ["delta", "gamma", "vega", "theta", "rho"])
-                                with greek_col2:
-                                    greek_option_type = st.radio("Option Type", ["Call", "Put"], horizontal=True)
-                                
-                                # Display Greeks table
-                                greeks_cols = ['Strike', 'call_delta', 'call_gamma', 'call_vega', 'call_theta', 'call_rho',
-                                             'put_delta', 'put_gamma', 'put_vega', 'put_theta', 'put_rho']
-                                available_cols = [col for col in greeks_cols if col in full_chain_df.columns]
-                                greeks_df = full_chain_df[available_cols].copy()
-                                
-                                # Rename columns for display
-                                display_names = {
-                                    'call_delta': 'Call Δ', 'call_gamma': 'Call Γ', 'call_vega': 'Call V', 
-                                    'call_theta': 'Call Θ', 'call_rho': 'Call ρ',
-                                    'put_delta': 'Put Δ', 'put_gamma': 'Put Γ', 'put_vega': 'Put V', 
-                                    'put_theta': 'Put Θ', 'put_rho': 'Put ρ'
-                                }
-                                greeks_df.rename(columns=display_names, inplace=True)
-                                
-                                # Filter for near ATM strikes
-                                atm_idx = (greeks_df['Strike'] - spot_price).abs().idxmin()
-                                start_idx = max(0, atm_idx - 10)
-                                end_idx = min(len(greeks_df), atm_idx + 11)
-                                
-                                # Style the dataframe
-                                styled_greeks = greeks_df.iloc[start_idx:end_idx].style.format({
-                                    'Strike': '{:.0f}',
-                                    **{col: '{:.4f}' for col in greeks_df.columns if col != 'Strike'}
-                                }).background_gradient(subset=[col for col in greeks_df.columns if 'Δ' in col], cmap='RdYlGn')
-                                
-                                st.dataframe(styled_greeks, use_container_width=True)
-                                
-                                # Greeks visualization
-                                greek_surface = create_greeks_surface(full_chain_df, selected_greek, greek_option_type)
-                                if greek_surface:
-                                    st.plotly_chart(greek_surface, use_container_width=True)
-                        
-                        with tab6:
-                            if show_strategy:
-                                st.subheader("Strategy Analysis")
-                                
-                                # Strategy selector
-                                strategy = st.selectbox("Select Strategy", 
-                                                      ["Long Straddle", "Short Straddle", "Long Strangle", 
-                                                       "Short Strangle", "Bull Call Spread", "Bear Put Spread"])
-                                
-                                # Display strategy payoff
-                                payoff_chart = create_strategy_payoff(full_chain_df, spot_price)
-                                st.plotly_chart(payoff_chart, use_container_width=True)
-                                
-                                # Strategy metrics
-                                atm_idx = (full_chain_df['Strike'] - spot_price).abs().idxmin()
-                                call_premium = full_chain_df.loc[atm_idx, 'Call LTP']
-                                put_premium = full_chain_df.loc[atm_idx, 'Put LTP']
-                                
-                                col1, col2, col3 = st.columns(3)
-                                with col1:
-                                    st.metric("Total Premium", f"₹{call_premium + put_premium:.2f}")
-                                with col2:
-                                    upper_be = atm_strike + call_premium + put_premium
-                                    st.metric("Upper Breakeven", f"₹{upper_be:.2f}")
-                                with col3:
-                                    lower_be = atm_strike - call_premium - put_premium
-                                    st.metric("Lower Breakeven", f"₹{lower_be:.2f}")
-                        
-                        with tab7:
-                            if 'historical_data' in st.session_state and not st.session_state.historical_data.empty:
-                                hist_df = st.session_state.historical_data
-                                
-                                # Sentiment & PCR Trend
-                                fig = go.Figure()
-                                fig.add_trace(go.Scatter(x=hist_df['timestamp'], y=hist_df['sentiment'], 
-                                                       mode='lines+markers', name='Sentiment', yaxis='y'))
-                                fig.add_trace(go.Scatter(x=hist_df['timestamp'], y=hist_df['pcr'], 
-                                                       mode='lines+markers', name='PCR', yaxis='y2'))
-                                
-                                fig.update_layout(
-                                    title='Historical Sentiment & PCR',
-                                    xaxis_title='Time',
-                                    yaxis=dict(title='Sentiment', side='left'),
-                                    yaxis2=dict(title='PCR', side='right', overlaying='y'),
-                                    hovermode='x unified',
-                                    height=400
-                                )
-                                st.plotly_chart(fig, use_container_width=True)
-                                
-                                # Max Pain Trend
-                                fig2 = go.Figure()
-                                fig2.add_trace(go.Scatter(x=hist_df['timestamp'], y=hist_df['max_pain'], 
-                                                        mode='lines+markers', name='Max Pain'))
-                                fig2.update_layout(
-                                    title='Max Pain Movement',
-                                    xaxis_title='Time',
-                                    yaxis_title='Max Pain',
-                                    height=300
-                                )
-                                st.plotly_chart(fig2, use_container_width=True)
-                            else:
-                                st.info("Historical data will be tracked during this session.")
-                        
-                        with tab8:  # OI Flow Analysis Tab
-                            st.subheader("🔍 Advanced OI Flow Analysis")
-                            
-                            # Initialize OI analyzer
-                            if 'oi_analyzer' not in st.session_state:
-                                st.session_state.oi_analyzer = RealTimeOIFlowAnalyzer(config)
-                            
-                            oi_analyzer = st.session_state.oi_analyzer
-                            
-                            # Analysis controls
-                            col1, col2 = st.columns([2, 1])
-                            with col1:
-                                analysis_timeframe = st.selectbox(
-                                    "Analysis Timeframe",
-                                    ["5min", "10min", "30min", "1hour", "2hour", "daily"],
-                                    key="oi_flow_timeframe"
-                                )
-                            
-                            with col2:
-                                if st.button("🔄 Analyze OI Flow", use_container_width=True):
-                                    # Run OI flow analysis
-                                    with st.spinner("Analyzing OI flow patterns..."):
-                                        oi_analysis_results = oi_analyzer.analyze_oi_flow_patterns(
-                                            full_chain_df, spot_price, analysis_timeframe
-                                        )
-                                        
-                                        # Store results in session state
-                                        st.session_state.oi_analysis_results = oi_analysis_results
-                                        st.session_state.oi_analysis_timestamp = datetime.now()
-                            
-                            # Display results if available
-                            if 'oi_analysis_results' in st.session_state:
-                                results = st.session_state.oi_analysis_results
-                                
-                                # Show analysis timestamp
-                                if 'oi_analysis_timestamp' in st.session_state:
-                                    time_diff = (datetime.now() - st.session_state.oi_analysis_timestamp).seconds
-                                    st.info(f"Analysis performed {time_diff} seconds ago")
-                                
-                                # Create dashboard
-                                create_oi_flow_dashboard(oi_analyzer, results, full_chain_df, spot_price)
-                                
-                                # Institutional Activity
-                                if results.get('institutional_activity'):
-                                    st.subheader("🏢 Institutional Activity")
-                                    inst_df = pd.DataFrame(results['institutional_activity'])
-                                    
-                                    # Group by flow type
-                                    flow_summary = inst_df.groupby('flow_type').agg({
-                                        'size': 'sum',
-                                        'premium_involved': 'sum'
-                                    }).round(0)
-                                    
-                                    col1, col2 = st.columns(2)
-                                    with col1:
-                                        st.dataframe(flow_summary, use_container_width=True)
-                                    
-                                    with col2:
-                                        # Pie chart of flow types
-                                        fig = go.Figure(data=[go.Pie(
-                                            labels=flow_summary.index,
-                                            values=flow_summary['size'],
-                                            hole=0.3
-                                        )])
-                                        fig.update_layout(
-                                            title="Institutional Flow Distribution",
-                                            height=300
-                                        )
-                                        st.plotly_chart(fig, use_container_width=True)
-                                
-                                # Key Levels
-                                if results.get('key_levels'):
-                                    st.subheader("🎯 Key OI-Based Levels")
-                                    levels = results['key_levels']
-                                    
-                                    col1, col2 = st.columns(2)
-                                    with col1:
-                                        if levels.get('resistance'):
-                                            st.error(f"🔴 Resistance: {', '.join(map(str, levels['resistance']))}")
-                                    
-                                    with col2:
-                                        if levels.get('support'):
-                                            st.success(f"🟢 Support: {', '.join(map(str, levels['support']))}")
-                                
-                                # Export OI Analysis
-                                if st.button("📥 Export OI Flow Analysis"):
-                                    try:
-                                        export_data = {
-                                            'timestamp': datetime.now().isoformat(),
-                                            'symbol': symbol,
-                                            'expiry': selected_expiry,
-                                            'spot_price': spot_price,
-                                            'timeframe': analysis_timeframe,
-                                            'analysis_results': {
-                                                'footprints': [
-                                                    {
-                                                        'timestamp': fp.timestamp.isoformat(),
-                                                        'strike': fp.strike,
-                                                        'option_type': fp.option_type,
-                                                        'oi_change': fp.oi_change,
-                                                        'volume': fp.volume,
-                                                        'large_trade': fp.large_trade_indicator,
-                                                        'aggressor': fp.aggressor_side
-                                                    } for fp in results['footprints']
-                                                ],
-                                                'signals': results['signals'],
-                                                'alerts': results['manipulation_alerts'],
-                                                'institutional_activity': results['institutional_activity'],
-                                                'market_regime': results['market_regime']
-                                            }
-                                        }
-                                        
-                                        st.download_button(
-                                            "Download OI Analysis JSON",
-                                            data=json.dumps(export_data, indent=2),
-                                            file_name=f"oi_flow_analysis_{symbol}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-                                            mime="application/json"
-                                        )
-                                    except Exception as e:
-                                        logger.error(f"Error exporting OI analysis: {e}")
-                                        st.error("Failed to export OI analysis")
-                        
-                        # Options Chain Table
-                        st.subheader("📋 Options Chain Data")
-                        
-                        # Advanced Filters
-                        with st.expander("🔍 Advanced Filters", expanded=False):
-                            col1, col2, col3, col4 = st.columns(4)
-                            with col1:
-                                strike_range = st.slider("Strike Range", 
-                                                       int(full_chain_df['Strike'].min()), 
-                                                       int(full_chain_df['Strike'].max()),
-                                                       (int(spot_price - 1000), int(spot_price + 1000)))
-                            with col2:
-                                oi_filter = st.number_input("Min OI Filter", value=0, step=1000)
-                            with col3:
-                                volume_filter = st.number_input("Min Volume Filter", value=0, step=100)
-                            with col4:
-                                moneyness = st.selectbox("Moneyness", ["All", "ITM", "ATM", "OTM"])
-                        
-                        # Apply filters
-                        filtered_df = full_chain_df[
-                            (full_chain_df['Strike'] >= strike_range[0]) & 
-                            (full_chain_df['Strike'] <= strike_range[1]) &
-                            ((full_chain_df['Call OI'] >= oi_filter) | (full_chain_df['Put OI'] >= oi_filter)) &
-                            ((full_chain_df['Call Volume'] >= volume_filter) | (full_chain_df['Put Volume'] >= volume_filter))
-                        ].copy()
-                        
-                        # Apply moneyness filter
-                        if moneyness == "ITM":
-                            filtered_df = filtered_df[
-                                ((filtered_df['Strike'] < spot_price) & (filtered_df['Put LTP'] > 0)) |
-                                ((filtered_df['Strike'] > spot_price) & (filtered_df['Call LTP'] > 0))
-                            ]
-                        elif moneyness == "ATM":
-                            atm_range = config.get_strike_step(symbol) * 2
-                            filtered_df = filtered_df[
-                                (filtered_df['Strike'] >= spot_price - atm_range) & 
-                                (filtered_df['Strike'] <= spot_price + atm_range)
-                            ]
-                        elif moneyness == "OTM":
-                            filtered_df = filtered_df[
-                                ((filtered_df['Strike'] > spot_price) & (filtered_df['Put LTP'] > 0)) |
-                                ((filtered_df['Strike'] < spot_price) & (filtered_df['Call LTP'] > 0))
-                            ]
-                        
-                        # Display columns
-                        display_cols = ['Call OI', 'Call Chng OI', 'Call LTP', 'Call Volume', 'Strike', 
-                                      'Put LTP', 'Put Volume', 'Put Chng OI', 'Put OI']
-                        
-                        if 'Call IV' in filtered_df.columns:
-                            display_cols.extend(['Call IV', 'Put IV'])
-                        
-                        # Add moneyness indicator
-                        try:
-                            filtered_df['Moneyness'] = filtered_df.apply(
-                                lambda row: 'ITM' if (row['Strike'] < spot_price and row['Put LTP'] > 0) or 
-                                                   (row['Strike'] > spot_price and row['Call LTP'] > 0)
-                                else 'OTM' if (row['Strike'] > spot_price and row['Put LTP'] > 0) or 
-                                             (row['Strike'] < spot_price and row['Call LTP'] > 0)
-                                else 'ATM', axis=1
-                            )
-                        except Exception as e:
-                            logger.error(f"Error calculating moneyness: {e}")
-                            filtered_df['Moneyness'] = 'Unknown'
-                        
-                        # Style the dataframe
-                        def highlight_moneyness(row):
-                            if row['Moneyness'] == 'ITM':
-                                return ['background-color: #e8f5e9'] * len(row)
-                            elif row['Moneyness'] == 'ATM':
-                                return ['background-color: #fff3e0'] * len(row)
-                            else:
-                                return [''] * len(row)
-                        
-                        try:
-                            styled_df = filtered_df[display_cols + ['Moneyness']].style.format({
-                                'Call OI': '{:,.0f}',
-                                'Call Chng OI': '{:+,.0f}',
-                                'Call LTP': '{:,.2f}',
-                                'Call Volume': '{:,.0f}',
-                                'Strike': '{:,.0f}',
-                                'Put LTP': '{:,.2f}',
-                                'Put Chng OI': '{:+,.0f}',
-                                'Put OI': '{:,.0f}',
-                                'Put Volume': '{:,.0f}',
-                                'Call IV': '{:.1f}%',
-                                'Put IV': '{:.1f}%'
-                            }).background_gradient(subset=['Call OI', 'Put OI'], cmap='YlOrRd'
-                            ).apply(highlight_moneyness, axis=1)
-                            
-                            # Display the table
-                            st.dataframe(styled_df, use_container_width=True, height=600)
-                        except Exception as e:
-                            logger.error(f"Error styling dataframe: {e}")
-                            st.dataframe(filtered_df[display_cols + ['Moneyness']], use_container_width=True, height=600)
-                        
-                        # Summary statistics
-                        with st.expander("📊 Summary Statistics"):
-                            col1, col2 = st.columns(2)
-                            with col1:
-                                st.write("**Call Options Summary:**")
-                                st.write(f"- Total OI: {filtered_df['Call OI'].sum():,.0f}")
-                                st.write(f"- Total Volume: {filtered_df['Call Volume'].sum():,.0f}")
-                                if 'Call IV' in filtered_df.columns:
-                                    st.write(f"- Avg IV: {filtered_df['Call IV'].mean():.1f}%")
-                                if not filtered_df.empty:
-                                    st.write(f"- Max OI Strike: {filtered_df.loc[filtered_df['Call OI'].idxmax(), 'Strike']:,.0f}")
-                            
-                            with col2:
-                                st.write("**Put Options Summary:**")
-                                st.write(f"- Total OI: {filtered_df['Put OI'].sum():,.0f}")
-                                st.write(f"- Total Volume: {filtered_df['Put Volume'].sum():,.0f}")
-                                if 'Put IV' in filtered_df.columns:
-                                    st.write(f"- Avg IV: {filtered_df['Put IV'].mean():.1f}%")
-                                if not filtered_df.empty:
-                                    st.write(f"- Max OI Strike: {filtered_df.loc[filtered_df['Put OI'].idxmax(), 'Strike']:,.0f}")
-                        
-                        # Export functionality
-                        if st.sidebar.button("📥 Export Data", use_container_width=True):
-                            export_df = prepare_export_data(full_chain_df, export_format)
-                            if export_df is not None:
-                                try:
-                                    export_data_dict = {
-                                        'metadata': {
-                                            'symbol': symbol,
-                                            'expiry': selected_expiry,
-                                            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                                            'spot_price': spot_price,
-                                            'metrics': metrics,
-                                            'data_mode': data_mode
-                                        },
-                                        'chain_data': export_df.to_dict('records')
-                                    }
-                                    
-                                    # Add real-time data if available
-                                    if st.session_state.real_time_enabled and 'rt_analyzer' in st.session_state:
-                                        rt_analyzer = st.session_state.rt_analyzer
-                                        if rt_analyzer.streamer:
-                                            rt_data = rt_analyzer.get_real_time_data(300)  # Last 5 minutes
-                                            export_data_dict['real_time_data'] = {
-                                                'oi_changes': rt_data['oi_changes'],
-                                                'price_changes': rt_data['price_changes'],
-                                                'alerts': [
-                                                    {
-                                                        'timestamp': alert.timestamp.isoformat(),
-                                                        'type': alert.alert_type,
-                                                        'strike': alert.strike,
-                                                        'option_type': alert.option_type,
-                                                        'message': alert.message,
-                                                        'severity': alert.severity
-                                                    } for alert in rt_data['alerts']
-                                                ]
-                                            }
-                                    
-                                    if export_format == "JSON":
-                                        json_str = json.dumps(export_data_dict, indent=2, default=str)
-                                        st.download_button(
-                                            label="Download JSON",
-                                            data=json_str,
-                                            file_name=f"{symbol}_options_chain_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-                                            mime="application/json"
-                                        )
-                                    elif export_format == "CSV":
-                                        csv = export_df.to_csv(index=False)
-                                        st.download_button(
-                                            label="Download CSV",
-                                            data=csv,
-                                            file_name=f"{symbol}_options_chain_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                                            mime="text/csv"
-                                        )
-                                    elif export_format == "Excel":
-                                        output = BytesIO()
-                                        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                                            export_df.to_excel(writer, sheet_name='Options Chain', index=False)
-                                            pd.DataFrame([metrics]).to_excel(writer, sheet_name='Metrics', index=False)
-                                            if 'historical_data' in st.session_state and not st.session_state.historical_data.empty:
-                                                st.session_state.historical_data.to_excel(
-                                                    writer, sheet_name='Historical', index=False
-                                                )
-                                            
-                                            # Add OI analysis results if available
-                                            if 'oi_analysis_results' in st.session_state:
-                                                results = st.session_state.oi_analysis_results
-                                                if results.get('institutional_activity'):
-                                                    pd.DataFrame(results['institutional_activity']).to_excel(
-                                                        writer, sheet_name='Institutional Flow', index=False
-                                                    )
-                                                if results.get('signals'):
-                                                    pd.DataFrame(results['signals']).to_excel(
-                                                        writer, sheet_name='Trading Signals', index=False
-                                                    )
-                                        
-                                        excel_data = output.getvalue()
-                                        st.download_button(
-                                            label="Download Excel",
-                                            data=excel_data,
-                                            file_name=f"{symbol}_options_chain_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                                        )
-                                except Exception as e:
-                                    logger.error(f"Error exporting data: {e}")
-                                    st.error(f"Failed to export data: {e}")
-                    
-                    else:
-                        st.error("No data to display. The options chain might be empty.")
-                else:
-                    st.error("Failed to fetch options data. Please try again.")
-                    
             except BreezeAPIError as e:
                 st.error(str(e))
                 logger.error(f"API Error: {e}")
             except Exception as e:
                 st.error(f"An unexpected error occurred: {e}")
                 logger.error(f"Unexpected error: {e}", exc_info=True)
-            finally:
-                # Reset fetch in progress flag
-                st.session_state.data_fetch_in_progress = False
+        
+        # Display data if available in session state
+        if 'current_chain_df' in st.session_state and not st.session_state.current_chain_df.empty:
+            full_chain_df = st.session_state.current_chain_df
+            metrics = st.session_state.current_metrics
+            spot_price = st.session_state.current_spot_price
+            atm_strike = st.session_state.current_atm_strike
+            
+            # Display Key Metrics
+            st.subheader("📊 Key Metrics Dashboard")
+            
+            # Data mode indicator
+            if data_mode == "WebSocket Streaming":
+                rt_analyzer = st.session_state.get('rt_analyzer')
+                if rt_analyzer and rt_analyzer.get_real_time_status()['is_streaming']:
+                    st.success("🌐 WEBSOCKET LIVE - Real-time tick data streaming with no API limits")
+                else:
+                    st.warning("⚪ Static snapshot - Start WebSocket streaming for live tick updates")
+            elif data_mode == "Auto-Refresh":
+                st.info(f"🔄 AUTO-REFRESH - Updates every {refresh_interval} seconds")
+            else:
+                st.info("📷 STATIC MODE - Manual refresh required")
+            
+            # First row of metrics
+            col1, col2, col3, col4, col5, col6 = st.columns(6)
+            
+            with col1:
+                st.metric("Spot Price", f"₹{spot_price:,.2f}")
+            with col2:
+                st.metric("ATM Strike", f"₹{atm_strike:,.0f}")
+            with col3:
+                st.metric("Max Pain", f"₹{metrics['max_pain']:,.0f}")
+            with col4:
+                st.metric("PCR", f"{metrics['pcr']:.2f}")
+            with col5:
+                net_oi_delta = f"{metrics['net_oi_change']:+,.0f}"
+                st.metric("Net OI Δ", net_oi_delta)
+            with col6:
+                sentiment_text = "Bullish" if metrics['sentiment'] > 20 else "Bearish" if metrics['sentiment'] < -20 else "Neutral"
+                st.metric("Sentiment", sentiment_text, f"{metrics['sentiment']:.0f}")
+            
+            # Sentiment Gauge
+            col1, col2 = st.columns([1, 2])
+            with col1:
+                st.plotly_chart(display_sentiment_gauge(metrics['sentiment']), use_container_width=True)
+            
+            with col2:
+                # Support & Resistance Levels
+                st.info(f"**🔴 Key Resistance:** {', '.join(map(str, metrics['resistance']))}")
+                st.success(f"**🟢 Key Support:** {', '.join(map(str, metrics['support']))}")
+                
+                # Additional insights
+                days_to_expiry = (datetime.strptime(selected_expiry, "%d-%b-%Y") - datetime.now()).days
+                st.warning(f"**📅 Days to Expiry:** {days_to_expiry}")
+            
+            # Tabs for different views
+            tabs = ["📊 OI Analysis", "🔥 Heatmap", "😊 IV Analysis", "📈 Volume", 
+                    "🧮 Greeks", "📉 Strategy", "⏳ History", "🔍 OI Flow"]
+            tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(tabs)
+            
+            with tab1:  # Enhanced OI Analysis tab
+                create_enhanced_oi_analysis_tab(full_chain_df, spot_price, symbol)
+            
+            with tab2:
+                st.plotly_chart(create_heatmap(full_chain_df), use_container_width=True)
+            
+            with tab3:
+                if show_iv_smile and 'Call IV' in full_chain_df.columns:
+                    iv_chart = create_iv_smile_chart(full_chain_df, spot_price)
+                    if iv_chart:
+                        st.plotly_chart(iv_chart, use_container_width=True)
+                        
+                        # IV Statistics
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.metric("Avg Call IV", f"{full_chain_df['Call IV'].mean():.1f}%")
+                            st.metric("ATM Call IV", f"{full_chain_df.loc[full_chain_df['Strike'] == atm_strike, 'Call IV'].values[0]:.1f}%")
+                        with col2:
+                            st.metric("Avg Put IV", f"{full_chain_df['Put IV'].mean():.1f}%")
+                            st.metric("ATM Put IV", f"{full_chain_df.loc[full_chain_df['Strike'] == atm_strike, 'Put IV'].values[0]:.1f}%")
+                    else:
+                        st.info("IV Smile chart not available")
+            
+            with tab4:
+                if show_volume:
+                    st.plotly_chart(create_volume_profile(full_chain_df), use_container_width=True)
+                    
+                    # Volume Statistics
+                    total_call_vol = full_chain_df['Call Volume'].sum()
+                    total_put_vol = full_chain_df['Put Volume'].sum()
+                    vol_ratio = total_put_vol / total_call_vol if total_call_vol > 0 else 0
+                    
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Total Call Volume", f"{total_call_vol:,.0f}")
+                    with col2:
+                        st.metric("Total Put Volume", f"{total_put_vol:,.0f}")
+                    with col3:
+                        st.metric("Put/Call Volume Ratio", f"{vol_ratio:.2f}")
+            
+            with tab5:
+                if show_greeks and 'call_delta' in full_chain_df.columns:
+                    # Greeks visualization options
+                    greek_col1, greek_col2 = st.columns(2)
+                    with greek_col1:
+                        selected_greek = st.selectbox("Select Greek", ["delta", "gamma", "vega", "theta", "rho"])
+                    with greek_col2:
+                        greek_option_type = st.radio("Option Type", ["Call", "Put"], horizontal=True)
+                    
+                    # Display Greeks table
+                    greeks_cols = ['Strike', 'call_delta', 'call_gamma', 'call_vega', 'call_theta', 'call_rho',
+                                 'put_delta', 'put_gamma', 'put_vega', 'put_theta', 'put_rho']
+                    available_cols = [col for col in greeks_cols if col in full_chain_df.columns]
+                    greeks_df = full_chain_df[available_cols].copy()
+                    
+                    # Rename columns for display
+                    display_names = {
+                        'call_delta': 'Call Δ', 'call_gamma': 'Call Γ', 'call_vega': 'Call V', 
+                        'call_theta': 'Call Θ', 'call_rho': 'Call ρ',
+                        'put_delta': 'Put Δ', 'put_gamma': 'Put Γ', 'put_vega': 'Put V', 
+                        'put_theta': 'Put Θ', 'put_rho': 'Put ρ'
+                    }
+                    greeks_df.rename(columns=display_names, inplace=True)
+                    
+                    # Filter for near ATM strikes
+                    atm_idx = (greeks_df['Strike'] - spot_price).abs().idxmin()
+                    start_idx = max(0, atm_idx - 10)
+                    end_idx = min(len(greeks_df), atm_idx + 11)
+                    
+                    # Style the dataframe
+                    styled_greeks = greeks_df.iloc[start_idx:end_idx].style.format({
+                        'Strike': '{:.0f}',
+                        **{col: '{:.4f}' for col in greeks_df.columns if col != 'Strike'}
+                    }).background_gradient(subset=[col for col in greeks_df.columns if 'Δ' in col], cmap='RdYlGn')
+                    
+                    st.dataframe(styled_greeks, use_container_width=True)
+                    
+                    # Greeks visualization
+                    greek_surface = create_greeks_surface(full_chain_df, selected_greek, greek_option_type)
+                    if greek_surface:
+                        st.plotly_chart(greek_surface, use_container_width=True)
+            
+            with tab6:
+                if show_strategy:
+                    st.subheader("Strategy Analysis")
+                    
+                    # Strategy selector
+                    strategy = st.selectbox("Select Strategy", 
+                                          ["Long Straddle", "Short Straddle", "Long Strangle", 
+                                           "Short Strangle", "Bull Call Spread", "Bear Put Spread"])
+                    
+                    # Display strategy payoff
+                    payoff_chart = create_strategy_payoff(full_chain_df, spot_price)
+                    st.plotly_chart(payoff_chart, use_container_width=True)
+                    
+                    # Strategy metrics
+                    atm_idx = (full_chain_df['Strike'] - spot_price).abs().idxmin()
+                    call_premium = full_chain_df.loc[atm_idx, 'Call LTP']
+                    put_premium = full_chain_df.loc[atm_idx, 'Put LTP']
+                    
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Total Premium", f"₹{call_premium + put_premium:.2f}")
+                    with col2:
+                        upper_be = atm_strike + call_premium + put_premium
+                        st.metric("Upper Breakeven", f"₹{upper_be:.2f}")
+                    with col3:
+                        lower_be = atm_strike - call_premium - put_premium
+                        st.metric("Lower Breakeven", f"₹{lower_be:.2f}")
+            
+            with tab7:
+                if 'historical_data' in st.session_state and not st.session_state.historical_data.empty:
+                    hist_df = st.session_state.historical_data
+                    
+                    # Sentiment & PCR Trend
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(x=hist_df['timestamp'], y=hist_df['sentiment'], 
+                                           mode='lines+markers', name='Sentiment', yaxis='y'))
+                    fig.add_trace(go.Scatter(x=hist_df['timestamp'], y=hist_df['pcr'], 
+                                           mode='lines+markers', name='PCR', yaxis='y2'))
+                    
+                    fig.update_layout(
+                        title='Historical Sentiment & PCR',
+                        xaxis_title='Time',
+                        yaxis=dict(title='Sentiment', side='left'),
+                        yaxis2=dict(title='PCR', side='right', overlaying='y'),
+                        hovermode='x unified',
+                        height=400
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                    # Max Pain Trend
+                    fig2 = go.Figure()
+                    fig2.add_trace(go.Scatter(x=hist_df['timestamp'], y=hist_df['max_pain'], 
+                                            mode='lines+markers', name='Max Pain'))
+                    fig2.update_layout(
+                        title='Max Pain Movement',
+                        xaxis_title='Time',
+                        yaxis_title='Max Pain',
+                        height=300
+                    )
+                    st.plotly_chart(fig2, use_container_width=True)
+                else:
+                    st.info("Historical data will be tracked during this session.")
+            
+            with tab8:  # OI Flow Analysis Tab
+                st.subheader("🔍 Advanced OI Flow Analysis")
+                
+                # Initialize OI analyzer
+                if 'oi_analyzer' not in st.session_state:
+                    st.session_state.oi_analyzer = RealTimeOIFlowAnalyzer(config)
+                
+                oi_analyzer = st.session_state.oi_analyzer
+                
+                # Analysis controls
+                col1, col2 = st.columns([2, 1])
+                with col1:
+                    analysis_timeframe = st.selectbox(
+                        "Analysis Timeframe",
+                        ["5min", "10min", "30min", "1hour", "2hour", "daily"],
+                        key="oi_flow_timeframe"
+                    )
+                
+                with col2:
+                    if st.button("🔄 Analyze OI Flow", use_container_width=True):
+                        # Run OI flow analysis
+                        with st.spinner("Analyzing OI flow patterns..."):
+                            oi_analysis_results = oi_analyzer.analyze_oi_flow_patterns(
+                                full_chain_df, spot_price, analysis_timeframe
+                            )
+                            
+                            # Store results in session state
+                            st.session_state.oi_analysis_results = oi_analysis_results
+                            st.session_state.oi_analysis_timestamp = datetime.now()
+                
+                # Display results if available
+                if 'oi_analysis_results' in st.session_state:
+                    results = st.session_state.oi_analysis_results
+                    
+                    # Show analysis timestamp
+                    if 'oi_analysis_timestamp' in st.session_state:
+                        time_diff = (datetime.now() - st.session_state.oi_analysis_timestamp).seconds
+                        st.info(f"Analysis performed {time_diff} seconds ago")
+                    
+                    # Create dashboard
+                    create_oi_flow_dashboard(oi_analyzer, results, full_chain_df, spot_price)
+                    
+                    # Institutional Activity
+                    if results.get('institutional_activity'):
+                        st.subheader("🏢 Institutional Activity")
+                        inst_df = pd.DataFrame(results['institutional_activity'])
+                        
+                        # Group by flow type
+                        flow_summary = inst_df.groupby('flow_type').agg({
+                            'size': 'sum',
+                            'premium_involved': 'sum'
+                        }).round(0)
+                        
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.dataframe(flow_summary, use_container_width=True)
+                        
+                        with col2:
+                            # Pie chart of flow types
+                            fig = go.Figure(data=[go.Pie(
+                                labels=flow_summary.index,
+                                values=flow_summary['size'],
+                                hole=0.3
+                            )])
+                            fig.update_layout(
+                                title="Institutional Flow Distribution",
+                                height=300
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+                    
+                    # Key Levels
+                    if results.get('key_levels'):
+                        st.subheader("🎯 Key OI-Based Levels")
+                        levels = results['key_levels']
+                        
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            if levels.get('resistance'):
+                                st.error(f"🔴 Resistance: {', '.join(map(str, levels['resistance']))}")
+                        
+                        with col2:
+                            if levels.get('support'):
+                                st.success(f"🟢 Support: {', '.join(map(str, levels['support']))}")
+                    
+                    # Export OI Analysis
+                    if st.button("📥 Export OI Flow Analysis"):
+                        try:
+                            export_data = {
+                                'timestamp': datetime.now().isoformat(),
+                                'symbol': symbol,
+                                'expiry': selected_expiry,
+                                'spot_price': spot_price,
+                                'timeframe': analysis_timeframe,
+                                'analysis_results': {
+                                    'footprints': [
+                                        {
+                                            'timestamp': fp.timestamp.isoformat(),
+                                            'strike': fp.strike,
+                                            'option_type': fp.option_type,
+                                            'oi_change': fp.oi_change,
+                                            'volume': fp.volume,
+                                            'large_trade': fp.large_trade_indicator,
+                                            'aggressor': fp.aggressor_side
+                                        } for fp in results['footprints']
+                                    ],
+                                    'signals': results['signals'],
+                                    'alerts': results['manipulation_alerts'],
+                                    'institutional_activity': results['institutional_activity'],
+                                    'market_regime': results['market_regime']
+                                }
+                            }
+                            
+                            st.download_button(
+                                "Download OI Analysis JSON",
+                                data=json.dumps(export_data, indent=2),
+                                file_name=f"oi_flow_analysis_{symbol}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                                mime="application/json"
+                            )
+                        except Exception as e:
+                            logger.error(f"Error exporting OI analysis: {e}")
+                            st.error("Failed to export OI analysis")
+            
+            # Options Chain Table
+            st.subheader("📋 Options Chain Data")
+            
+            # Advanced Filters
+            with st.expander("🔍 Advanced Filters", expanded=False):
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    strike_range = st.slider("Strike Range", 
+                                           int(full_chain_df['Strike'].min()), 
+                                           int(full_chain_df['Strike'].max()),
+                                           (int(spot_price - 1000), int(spot_price + 1000)))
+                with col2:
+                    oi_filter = st.number_input("Min OI Filter", value=0, step=1000)
+                with col3:
+                    volume_filter = st.number_input("Min Volume Filter", value=0, step=100)
+                with col4:
+                    moneyness = st.selectbox("Moneyness", ["All", "ITM", "ATM", "OTM"])
+            
+            # Apply filters
+            filtered_df = full_chain_df[
+                (full_chain_df['Strike'] >= strike_range[0]) & 
+                (full_chain_df['Strike'] <= strike_range[1]) &
+                ((full_chain_df['Call OI'] >= oi_filter) | (full_chain_df['Put OI'] >= oi_filter)) &
+                ((full_chain_df['Call Volume'] >= volume_filter) | (full_chain_df['Put Volume'] >= volume_filter))
+            ].copy()
+            
+            # Apply moneyness filter
+            if moneyness == "ITM":
+                filtered_df = filtered_df[
+                    ((filtered_df['Strike'] < spot_price) & (filtered_df['Put LTP'] > 0)) |
+                    ((filtered_df['Strike'] > spot_price) & (filtered_df['Call LTP'] > 0))
+                ]
+            elif moneyness == "ATM":
+                atm_range = config.get_strike_step(symbol) * 2
+                filtered_df = filtered_df[
+                    (filtered_df['Strike'] >= spot_price - atm_range) & 
+                    (filtered_df['Strike'] <= spot_price + atm_range)
+                ]
+            elif moneyness == "OTM":
+                filtered_df = filtered_df[
+                    ((filtered_df['Strike'] > spot_price) & (filtered_df['Put LTP'] > 0)) |
+                    ((filtered_df['Strike'] < spot_price) & (filtered_df['Call LTP'] > 0))
+                ]
+            
+            # Display columns
+            display_cols = ['Call OI', 'Call Chng OI', 'Call LTP', 'Call Volume', 'Strike', 
+                          'Put LTP', 'Put Volume', 'Put Chng OI', 'Put OI']
+            
+            if 'Call IV' in filtered_df.columns:
+                display_cols.extend(['Call IV', 'Put IV'])
+            
+            # Add moneyness indicator
+            try:
+                filtered_df['Moneyness'] = filtered_df.apply(
+                    lambda row: 'ITM' if (row['Strike'] < spot_price and row['Put LTP'] > 0) or 
+                                       (row['Strike'] > spot_price and row['Call LTP'] > 0)
+                    else 'OTM' if (row['Strike'] > spot_price and row['Put LTP'] > 0) or 
+                                 (row['Strike'] < spot_price and row['Call LTP'] > 0)
+                    else 'ATM', axis=1
+                )
+            except Exception as e:
+                logger.error(f"Error calculating moneyness: {e}")
+                filtered_df['Moneyness'] = 'Unknown'
+            
+            # Style the dataframe
+            def highlight_moneyness(row):
+                if row['Moneyness'] == 'ITM':
+                    return ['background-color: #e8f5e9'] * len(row)
+                elif row['Moneyness'] == 'ATM':
+                    return ['background-color: #fff3e0'] * len(row)
+                else:
+                    return [''] * len(row)
+            
+            try:
+                styled_df = filtered_df[display_cols + ['Moneyness']].style.format({
+                    'Call OI': '{:,.0f}',
+                    'Call Chng OI': '{:+,.0f}',
+                    'Call LTP': '{:,.2f}',
+                    'Call Volume': '{:,.0f}',
+                    'Strike': '{:,.0f}',
+                    'Put LTP': '{:,.2f}',
+                    'Put Chng OI': '{:+,.0f}',
+                    'Put OI': '{:,.0f}',
+                    'Put Volume': '{:,.0f}',
+                    'Call IV': '{:.1f}%',
+                    'Put IV': '{:.1f}%'
+                }).background_gradient(subset=['Call OI', 'Put OI'], cmap='YlOrRd'
+                ).apply(highlight_moneyness, axis=1)
+                
+                # Display the table
+                st.dataframe(styled_df, use_container_width=True, height=600)
+            except Exception as e:
+                logger.error(f"Error styling dataframe: {e}")
+                st.dataframe(filtered_df[display_cols + ['Moneyness']], use_container_width=True, height=600)
+            
+            # Summary statistics
+            with st.expander("📊 Summary Statistics"):
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.write("**Call Options Summary:**")
+                    st.write(f"- Total OI: {filtered_df['Call OI'].sum():,.0f}")
+                    st.write(f"- Total Volume: {filtered_df['Call Volume'].sum():,.0f}")
+                    if 'Call IV' in filtered_df.columns:
+                        st.write(f"- Avg IV: {filtered_df['Call IV'].mean():.1f}%")
+                    if not filtered_df.empty:
+                        st.write(f"- Max OI Strike: {filtered_df.loc[filtered_df['Call OI'].idxmax(), 'Strike']:,.0f}")
+                
+                with col2:
+                    st.write("**Put Options Summary:**")
+                    st.write(f"- Total OI: {filtered_df['Put OI'].sum():,.0f}")
+                    st.write(f"- Total Volume: {filtered_df['Put Volume'].sum():,.0f}")
+                    if 'Put IV' in filtered_df.columns:
+                        st.write(f"- Avg IV: {filtered_df['Put IV'].mean():.1f}%")
+                    if not filtered_df.empty:
+                        st.write(f"- Max OI Strike: {filtered_df.loc[filtered_df['Put OI'].idxmax(), 'Strike']:,.0f}")
+            
+            # Export functionality
+            if st.sidebar.button("📥 Export Data", use_container_width=True):
+                export_df = prepare_export_data(full_chain_df, export_format)
+                if export_df is not None:
+                    try:
+                        export_data_dict = {
+                            'metadata': {
+                                'symbol': symbol,
+                                'expiry': selected_expiry,
+                                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                                'spot_price': spot_price,
+                                'metrics': metrics,
+                                'data_mode': data_mode
+                            },
+                            'chain_data': export_df.to_dict('records')
+                        }
+                        
+                        # Add real-time data if available
+                        if st.session_state.real_time_enabled and 'rt_analyzer' in st.session_state:
+                            rt_analyzer = st.session_state.rt_analyzer
+                            if rt_analyzer.streamer:
+                                rt_data = rt_analyzer.get_real_time_data(300)  # Last 5 minutes
+                                export_data_dict['real_time_data'] = {
+                                    'oi_changes': rt_data['oi_changes'],
+                                    'price_changes': rt_data['price_changes'],
+                                    'alerts': [
+                                        {
+                                            'timestamp': alert.timestamp.isoformat(),
+                                            'type': alert.alert_type,
+                                            'strike': alert.strike,
+                                            'option_type': alert.option_type,
+                                            'message': alert.message,
+                                            'severity': alert.severity
+                                        } for alert in rt_data['alerts']
+                                    ]
+                                }
+                        
+                        if export_format == "JSON":
+                            json_str = json.dumps(export_data_dict, indent=2, default=str)
+                            st.download_button(
+                                label="Download JSON",
+                                data=json_str,
+                                file_name=f"{symbol}_options_chain_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                                mime="application/json"
+                            )
+                        elif export_format == "CSV":
+                            csv = export_df.to_csv(index=False)
+                            st.download_button(
+                                label="Download CSV",
+                                data=csv,
+                                file_name=f"{symbol}_options_chain_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                                mime="text/csv"
+                            )
+                        elif export_format == "Excel":
+                            output = BytesIO()
+                            with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                                export_df.to_excel(writer, sheet_name='Options Chain', index=False)
+                                pd.DataFrame([metrics]).to_excel(writer, sheet_name='Metrics', index=False)
+                                if 'historical_data' in st.session_state and not st.session_state.historical_data.empty:
+                                    st.session_state.historical_data.to_excel(
+                                        writer, sheet_name='Historical', index=False
+                                    )
+                                
+                                # Add OI analysis results if available
+                                if 'oi_analysis_results' in st.session_state:
+                                    results = st.session_state.oi_analysis_results
+                                    if results.get('institutional_activity'):
+                                        pd.DataFrame(results['institutional_activity']).to_excel(
+                                            writer, sheet_name='Institutional Flow', index=False
+                                        )
+                                    if results.get('signals'):
+                                        pd.DataFrame(results['signals']).to_excel(
+                                            writer, sheet_name='Trading Signals', index=False
+                                        )
+                            
+                            excel_data = output.getvalue()
+                            st.download_button(
+                                label="Download Excel",
+                                data=excel_data,
+                                file_name=f"{symbol}_options_chain_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                            )
+                    except Exception as e:
+                        logger.error(f"Error exporting data: {e}")
+                        st.error(f"Failed to export data: {e}")
+        
         else:
             st.info("👆 Select data mode and refresh to load the options chain")
             
