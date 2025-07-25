@@ -8,6 +8,7 @@ breeze-connect
 
 # Visualization
 plotly
+matplotlib
 
 # Auto-refresh functionality
 streamlit-autorefresh
