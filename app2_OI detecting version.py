@@ -2736,6 +2736,7 @@ def create_greeks_surface(chain_df: pd.DataFrame, greek: str, option_type: str) 
         logger.error(f"Error creating Greeks surface: {e}")
         return None
 
+
 def track_historical_data_efficient(symbol: str, expiry: str, metrics: Dict[str, Any]) -> None:
     """Efficient historical data tracking with compression and error handling"""
     try:
@@ -3239,6 +3240,8 @@ def main():
             st.session_state.real_time_enabled = False
         if 'chain_data_loaded' not in st.session_state:
             st.session_state.chain_data_loaded = False
+        if 'data_fetch_in_progress' not in st.session_state:
+            st.session_state.data_fetch_in_progress = False
         
         # Sidebar Configuration
         with st.sidebar:
@@ -3269,6 +3272,9 @@ def main():
             if data_mode == "Auto-Refresh":
                 refresh_interval = st.slider("Refresh Interval (seconds)", 10, 300, 60)
                 st_autorefresh(interval=refresh_interval * 1000, key="datarefresh")
+                # Trigger data fetch on auto-refresh
+                if not st.session_state.data_fetch_in_progress:
+                    st.session_state.run_analysis = True
             elif data_mode == "WebSocket Streaming":
                 st.session_state.real_time_enabled = True
                 
@@ -3282,7 +3288,7 @@ def main():
                         logger.error(f"Analyzer initialization error: {e}")
                 
                 # Auto-trigger data fetch if not loaded
-                if not st.session_state.chain_data_loaded:
+                if not st.session_state.chain_data_loaded and not st.session_state.data_fetch_in_progress:
                     st.session_state.run_analysis = True
                 
                 st.info("🌐 WebSocket mode - No API rate limits!")
@@ -3420,24 +3426,27 @@ def main():
         with col3:
             if data_mode == "Static (Manual Refresh)":
                 if st.button("🔄 Refresh Data", type="primary", use_container_width=True):
-                    st.session_state.run_analysis = True
+                    if not st.session_state.data_fetch_in_progress:
+                        st.session_state.run_analysis = True
             elif data_mode == "WebSocket Streaming":
                 # Add a manual refresh button for WebSocket mode too
                 if st.button("📊 Load Chain", type="primary", use_container_width=True):
-                    st.session_state.run_analysis = True
-                    st.session_state.chain_data_loaded = False
+                    if not st.session_state.data_fetch_in_progress:
+                        st.session_state.run_analysis = True
+                        st.session_state.chain_data_loaded = False
         
         # Real-Time Dashboard (if enabled and before main analysis)
         if show_real_time_dashboard and st.session_state.real_time_enabled:
             create_real_time_dashboard()
             st.markdown("---")
         
-        # Fetch and analyze data - Updated condition for WebSocket mode
-        if (st.session_state.run_analysis or 
-            data_mode in ["Auto-Refresh", "WebSocket Streaming"] or 
-            (not st.session_state.chain_data_loaded and data_mode == "WebSocket Streaming")):
-            
+        # Fetch and analyze data - Prevent looping
+        if st.session_state.run_analysis and not st.session_state.data_fetch_in_progress:
             try:
+                # Set fetch in progress flag to prevent re-entry
+                st.session_state.data_fetch_in_progress = True
+                st.session_state.run_analysis = False  # Reset immediately
+                
                 api_expiry_date = expiry_map[selected_expiry]
                 raw_data, spot_price = get_options_chain_data_with_retry(breeze, symbol, api_expiry_date)
                 
@@ -3447,7 +3456,6 @@ def main():
                     if not full_chain_df.empty:
                         # Mark data as loaded
                         st.session_state.chain_data_loaded = True
-                        st.session_state.run_analysis = False  # Reset the flag
                         
                         # Calculate metrics
                         metrics = calculate_dashboard_metrics(full_chain_df, spot_price)
@@ -3988,6 +3996,9 @@ def main():
             except Exception as e:
                 st.error(f"An unexpected error occurred: {e}")
                 logger.error(f"Unexpected error: {e}", exc_info=True)
+            finally:
+                # Reset fetch in progress flag
+                st.session_state.data_fetch_in_progress = False
         else:
             st.info("👆 Select data mode and refresh to load the options chain")
             
